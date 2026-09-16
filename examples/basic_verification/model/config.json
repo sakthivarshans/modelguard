@@ -1,0 +1,5 @@
+{
+  "model_type": "toy-classifier",
+  "hidden_size": 64,
+  "num_labels": 2
+}
