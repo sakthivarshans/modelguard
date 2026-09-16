@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modelguard"
+version = "0.1.0"
+description = "Open-source framework for AI/ML model supply-chain security: artifact integrity, ML-BOM, signing, and verification."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "ModelGuard Contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+
+# Core dependencies are kept intentionally small. Every dependency below
+# is required for Phase 1 (local inspect -> hash -> manifest -> mbom ->
+# sign -> verify) to function without any external service.
+dependencies = [
+    "pydantic>=2.6,<3",
+    "cryptography>=42.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# Reserved for later phases. Intentionally empty in Phase 1 so that
+# `pip install modelguard` never pulls in unused, unimplemented adapters.
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+modelguard = "modelguard.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modelguard"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
