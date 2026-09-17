@@ -40,13 +40,53 @@ not assume it works.
   denied even though the signature and digest are still valid.
 - **(Phase 2)** CLI: `modelguard register/resolve/revoke/lineage/provenance record`,
   and `modelguard verify --storage-root ...` for revocation-aware verification.
+- **(Phase 3)** A **policy engine** (`modelguard.policy`): YAML policy
+  documents loaded with `yaml.safe_load` and validated against a
+  strict schema (unknown top-level fields, unknown "policy:" fields,
+  and unknown rule names are all rejected, not silently ignored).
+  Five rules are implemented: `require_valid_signature`,
+  `require_ml_bom`, `require_known_lineage`, `require_license`,
+  `reject_revoked_models`. Each rule's failure maps to a configurable
+  `on_fail` action (`warn`/`review`/`quarantine`/`deny`); the overall
+  decision is the most severe triggered outcome
+  (`ALLOW`/`ALLOW_WITH_WARNINGS`/`REVIEW_REQUIRED`/`QUARANTINE`/`DENY`/`REVOKED`).
+  `reject_revoked_models` always escalates to `REVOKED` regardless of
+  its configured `on_fail`, since a revoked model must never be merely
+  a warning. Evaluation is a pure, deterministic function of a small
+  boolean context -- the same inputs always produce the same decision.
+- **(Phase 3)** SDK: `ModelGuard.check_policy(...)` runs `verify()`
+  and evaluates a policy against the result in one call.
+- **(Phase 3)** CLI: `modelguard policy validate` / `modelguard policy check`,
+  with distinct exit codes per decision (0 allowed, 2 deny,
+  3 review required, 4 quarantine, 5 revoked, 1 error).
 
 ## Explicitly NOT implemented yet
 
-- **No policy engine.** There is no allow/warn/review/deny/quarantine
-  decision logic yet, only a binary signature+digest+ML-BOM check plus
-  Phase 2's revocation check. `VerificationResult.allowed` does not yet
-  reflect scanner findings, license rules, or organizational policy.
+- **Only five policy rules exist**, and all of them evaluate boolean
+  signals ModelGuard can already compute (signature validity, ML-BOM
+  presence, declared lineage presence, declared license presence,
+  revocation). The rules described in the product document that
+  depend on data ModelGuard does not yet produce -- `max_critical_vulnerabilities`,
+  `max_high_vulnerabilities` (needs scanners), `require_human_approval_for_high_risk`
+  (needs risk classification), trusted-publisher allow-lists, format
+  allow/block-lists, and expiration -- are **not implemented and not
+  accepted** by the policy schema. A policy file referencing them is
+  rejected at load time (`UnknownRuleError`) rather than silently
+  accepted and ignored.
+- **No policy simulation / dry-run mode** that shows what a policy
+  *would* decide across a batch of historical artifacts without
+  actually gating anything.
+- **`require_license` and `require_known_lineage`, when reached
+  through `ModelGuard.check_policy()`, only look at the ML-BOM**, not
+  the original manifest -- `check_policy()` reconstructs a minimal
+  Manifest from the signature payload (which does not carry the
+  license field) rather than requiring the caller to also supply the
+  original manifest file. Call `modelguard.policy.evaluate()` directly
+  with a full `PolicyEvaluationContext` if you need manifest-level
+  license data considered.
+- **The policy engine does not yet integrate with scanners or the
+  registry beyond revocation** -- `reject_revoked_models` is the only
+  rule connected to Phase 2's registry.
 - **No PostgreSQL, S3, or FastAPI service.** Phase 2's registry and
   provenance store are local, file-backed implementations behind
   `Protocol` interfaces (`Registry`, and an implicit provenance-store
