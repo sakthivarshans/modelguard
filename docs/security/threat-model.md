@@ -39,3 +39,20 @@ It proves nothing about:
 - Whether the declared metadata (license, dataset references, parent
   model) is true -- it is recorded as `DECLARED` evidence precisely
   because it is unverified.
+
+## Addendum -- Phase 2 (Local Registry and Provenance)
+
+Phase 2 adds a local, file-backed registry, a hash-chained provenance
+store, and a hash-chained audit log. This addendum covers only what
+changed; everything above still applies unmodified.
+
+| Threat | Mitigation in this release | Residual risk |
+| --- | --- | --- |
+| A model_id/version silently repointed to a different artifact ("namespace confusion") | `LocalRegistry.register` rejects re-registration of an existing model_id/version outright (`DuplicateRegistrationError`). A new artifact requires a new version string. | None within scope; tested in `tests/unit/test_registry.py::test_duplicate_registration_is_rejected`. |
+| Path traversal via a malicious `model_id` or `version` string (e.g. `../../etc/passwd`) | Every identifier is validated before use as a filesystem path segment; traversal characters and separators are rejected. | Tested directly (`test_path_traversal_in_*_is_rejected`). |
+| A revoked model still verifying successfully | `ModelGuard.verify()` checks the registry's revocation state for the artifact's declared model_id/version whenever a `storage_root` is configured, and denies even a cryptographically valid signature. | Only applies when the caller configures `storage_root` and the artifact was registered with the same identity the verifier looks up. A caller that never registers a model, or that checks a different model_id, gets no revocation protection -- this is a scoping choice, not a bug, but it means revocation is opt-in, not automatic. |
+| Provenance or audit log tampered with after the fact | Every record is hash-chained (see `modelguard.audit.chain`); editing, reordering, or deleting a record from the middle of the log breaks the chain and is detected by `verify_chain()`. | **Not automatically checked.** Nothing in Phase 2 calls `verify_chain()` on every read for performance and simplicity reasons -- a caller must explicitly call `registry.verify()` / `provenance_store.verify()` / `audit_log.verify()` to detect tampering. A future release should decide whether to verify on every read by default (trading a small performance cost for automatic tamper detection) or keep it opt-in with clearer documentation. Flagged here as the most important gap to close before Phase 2 code is trusted for anything beyond local experimentation. |
+| Deletion of the most recent record(s) from a hash-chained log | Not detected. The chain only links backward; truncating the tail leaves a self-consistent, shorter chain. | Documented in `docs/limitations.md`. Closing this requires an external checkpoint (e.g. a periodically published Merkle root) that the local log cannot forge; not implemented. |
+| Concurrent writers corrupting the registry or provenance/audit logs | Not mitigated. `LocalRegistry` and the JSONL append operations assume a single writer. | A multi-writer deployment must wait for the PostgreSQL-backed adapter (later phase), which can use real transactions/locking. Do not point multiple concurrent processes at the same `storage_root` in production-like use. |
+| An attacker with local write access to `storage_root` forges a whole new self-consistent chain | Not mitigated -- see the corresponding limitation in the base hash-chain design above. | Out of scope for a purely local, no-external-trust-root implementation. |
+
