@@ -27,6 +27,17 @@ from modelguard.manifest.builder import DeclaredMetadata, build_manifest
 from modelguard.manifest.models import Manifest
 from modelguard.mbom.generator import DeclaredProvenance, generate_mbom
 from modelguard.mbom.models import MLBOM
+from modelguard.provenance.graph import (
+    children,
+    find_deployments_using_revoked_model,
+    find_models_derived_from,
+    lineage,
+    parents,
+)
+from modelguard.provenance.models import ProvenanceEvent, RelationshipType
+from modelguard.provenance.store import LocalProvenanceStore
+from modelguard.registry.local import LocalRegistry
+from modelguard.registry.models import RegistryRecord, RevocationRecord
 from modelguard.signing.envelope import SignatureEnvelope
 from modelguard.signing.keys import LocalKeyPair, load_public_key
 from modelguard.signing.signer import sign_artifact
@@ -52,6 +63,7 @@ class VerificationResult:
     artifact_digest: str
     signature_valid: bool
     mbom_valid: bool
+    revoked: bool = False
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     def raise_if_denied(self) -> None:
@@ -60,7 +72,34 @@ class VerificationResult:
 
 
 class ModelGuard:
-    """Primary entry point for the ModelGuard Python SDK."""
+    """Primary entry point for the ModelGuard Python SDK.
+
+    ``storage_root`` configures the local, file-backed registry,
+    provenance store, and audit log used by ``register``, ``resolve``,
+    ``revoke``, and the lineage query methods. It is optional because
+    Phase 1's inspect/sign/verify workflow needs no persistent state;
+    pass it (or call the registry-touching methods without it) and a
+    clear error explains what to configure.
+    """
+
+    def __init__(self, storage_root: str | Path | None = None) -> None:
+        self._storage_root = Path(storage_root) if storage_root else None
+
+    @property
+    def registry(self) -> LocalRegistry:
+        return LocalRegistry(self._require_storage_root() / "registry")
+
+    @property
+    def provenance_store(self) -> LocalProvenanceStore:
+        return LocalProvenanceStore(self._require_storage_root() / "provenance" / "events.jsonl")
+
+    def _require_storage_root(self) -> Path:
+        if self._storage_root is None:
+            raise ModelGuardError(
+                "This operation requires local storage. Construct ModelGuard with "
+                "a storage_root, e.g. ModelGuard(storage_root='./.modelguard')."
+            )
+        return self._storage_root
 
     def inspect(self, artifact_path: str | Path) -> ArtifactDigest:
         """Hash and inspect a local artifact without signing or verifying it."""
@@ -132,13 +171,119 @@ class ModelGuard:
 
         allowed = signature_valid and mbom_valid and digest_matches
 
+        # If a local registry is configured and this artifact is
+        # registered under a model_id, a revocation of that version
+        # must deny verification even though the signature and digest
+        # are still cryptographically valid -- revocation is a policy
+        # fact layered on top of, not a replacement for, cryptographic
+        # integrity.
+        revoked = False
+        if self._storage_root is not None and envelope.payload.model_id and envelope.payload.version:
+            revocation = self.registry.is_revoked(
+                envelope.payload.model_id, envelope.payload.version
+            )
+            if revocation is not None:
+                revoked = True
+                allowed = False
+                reasons.append(
+                    f"Model {revocation.model_id}@{revocation.version} was revoked by "
+                    f"{revocation.revoked_by}: {revocation.reason}"
+                )
+
         return VerificationResult(
             allowed=allowed,
             artifact_digest=current_digest,
             signature_valid=signature_valid,
             mbom_valid=mbom_valid,
+            revoked=revoked,
             reasons=tuple(reasons),
         )
 
     def load_public_key(self, path: str | Path) -> Ed25519PublicKey:
         return load_public_key(Path(path))
+
+    # -- registry ----------------------------------------------------
+
+    def register(
+        self, manifest: Manifest, mbom: MLBOM, actor: str
+    ) -> RegistryRecord:
+        """Register a manifest + ML-BOM pair under the manifest's
+        declared ``model_id``/``version``.
+
+        Raises if ``model_id`` or ``version`` is missing (a registry
+        entry without either is not resolvable by name), or if that
+        model_id/version pair is already registered.
+        """
+        if not manifest.model_id or not manifest.version:
+            raise ModelGuardError(
+                "Registering a model requires both model_id and version to be set "
+                "on the manifest."
+            )
+        record = RegistryRecord(
+            model_id=manifest.model_id,
+            version=manifest.version,
+            artifact_digest=f"{manifest.algorithm}:{manifest.digest}",
+            manifest=manifest,
+            mbom=mbom,
+            registered_by=actor,
+        )
+        return self.registry.register(record)
+
+    def resolve(self, model_id: str, version: str) -> RegistryRecord | None:
+        return self.registry.get(model_id, version)
+
+    def resolve_by_digest(self, artifact_digest: str) -> RegistryRecord | None:
+        return self.registry.get_by_digest(artifact_digest)
+
+    def revoke(self, model_id: str, version: str, actor: str, reason: str) -> RevocationRecord:
+        record = RevocationRecord(
+            model_id=model_id, version=version, revoked_by=actor, reason=reason
+        )
+        return self.registry.revoke(record)
+
+    def is_revoked(self, model_id: str, version: str) -> RevocationRecord | None:
+        return self.registry.is_revoked(model_id, version)
+
+    # -- provenance ----------------------------------------------------
+
+    def record_provenance(
+        self,
+        subject_id: str,
+        relationship: RelationshipType,
+        object_id: str,
+        actor: str,
+        evidence: str = "DECLARED",
+    ) -> ProvenanceEvent:
+        event = ProvenanceEvent(
+            subject_id=subject_id,
+            relationship=relationship,
+            object_id=object_id,
+            actor=actor,
+            evidence=evidence,  # type: ignore[arg-type]
+        )
+        return self.provenance_store.record(event)
+
+    def parents(self, model_id: str) -> list[ProvenanceEvent]:
+        return parents(self.provenance_store, model_id)
+
+    def children(self, model_id: str) -> list[ProvenanceEvent]:
+        return children(self.provenance_store, model_id)
+
+    def lineage(self, model_id: str) -> list[ProvenanceEvent]:
+        return lineage(self.provenance_store, model_id)
+
+    def find_models_derived_from(self, base_model_id: str) -> list[str]:
+        return find_models_derived_from(self.provenance_store, base_model_id)
+
+    def find_deployments_using_revoked_model(self) -> list[ProvenanceEvent]:
+        """Find DEPLOYED_TO events for any model that is currently
+        revoked, or transitively derived from a currently-revoked model.
+        """
+        revoked_ids: set[str] = set()
+        for event in self.provenance_store.all_events():
+            for candidate_id in (event.subject_id, event.object_id):
+                if self.registry.list_versions(candidate_id):
+                    for v in self.registry.list_versions(candidate_id):
+                        if self.registry.is_revoked(candidate_id, v):
+                            revoked_ids.add(candidate_id)
+        return find_deployments_using_revoked_model(self.provenance_store, revoked_ids)
