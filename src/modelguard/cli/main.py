@@ -1,9 +1,10 @@
 """ModelGuard command-line interface.
 
 Implements the Phase 1 slice of the CLI surface described in the
-architecture document: inspect, hash, manifest, mbom generate, keygen,
-sign, and verify. Every command supports ``--format json`` for CI use
-and returns a non-zero exit code on failure.
+architecture document (inspect, hash, manifest, mbom generate, keygen,
+sign, verify) plus the Phase 2 registry/provenance commands (register,
+resolve, revoke, lineage). Every command supports ``--format json`` for
+CI use and returns a non-zero exit code on failure.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from modelguard.signing.signer import sign_artifact
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_DENIED = 2
+
+_DEFAULT_STORAGE_ROOT = Path(".modelguard")
 
 
 @click.group()
@@ -182,14 +185,26 @@ def sign(
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("--mbom", "mbom_path", type=click.Path(exists=True, path_type=Path), required=True)
 @click.option("--signature", "signature_path", type=click.Path(exists=True, path_type=Path), required=True)
+@click.option(
+    "--storage-root",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Local registry root, to also check revocation status. Omit to skip that check.",
+)
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
-def verify(path: Path, mbom_path: Path, signature_path: Path, output_format: str) -> None:
+def verify(
+    path: Path,
+    mbom_path: Path,
+    signature_path: Path,
+    storage_root: Path | None,
+    output_format: str,
+) -> None:
     """Verify an artifact against its ML-BOM and detached signature.
 
     Exit code 0 if allowed, 2 if the verification was denied, 1 on an
     unexpected error (missing file, malformed input).
     """
-    guard = ModelGuard()
+    guard = ModelGuard(storage_root=storage_root)
     result = guard.verify(path, mbom_path, signature_path)
 
     if output_format == "json":
@@ -198,6 +213,7 @@ def verify(path: Path, mbom_path: Path, signature_path: Path, output_format: str
             "artifact_digest": result.artifact_digest,
             "signature_valid": result.signature_valid,
             "mbom_valid": result.mbom_valid,
+            "revoked": result.revoked,
             "reasons": list(result.reasons),
         }
         click.echo(json.dumps(payload, indent=2))
@@ -207,10 +223,131 @@ def verify(path: Path, mbom_path: Path, signature_path: Path, output_format: str
         click.echo(f"Digest       : {result.artifact_digest}")
         click.echo(f"Signature    : {'valid' if result.signature_valid else 'INVALID'}")
         click.echo(f"ML-BOM       : {'matches' if result.mbom_valid else 'DOES NOT MATCH'}")
+        if result.revoked:
+            click.echo("Revoked      : YES")
         for reason in result.reasons:
             click.echo(f"  reason: {reason}")
 
     sys.exit(EXIT_OK if result.allowed else EXIT_DENIED)
+
+
+@cli.command()
+@click.argument("manifest_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("mbom_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--actor", required=True, help="Identity performing the registration.")
+@click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
+def register(manifest_path: Path, mbom_path: Path, actor: str, storage_root: Path) -> None:
+    """Register a manifest + ML-BOM pair in the local registry."""
+    guard = ModelGuard(storage_root=storage_root)
+    try:
+        m = Manifest.model_validate(json.loads(manifest_path.read_text()))
+        bom = MLBOM.model_validate(json.loads(mbom_path.read_text()))
+        record = guard.register(m, bom, actor=actor)
+    except ModelGuardError as exc:
+        _fail(exc, "text")
+
+    click.echo(f"Registered {record.model_id}@{record.version}")
+    click.echo(f"URI: {record.uri}")
+
+
+@cli.command()
+@click.argument("model_id")
+@click.argument("version")
+@click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def resolve(model_id: str, version: str, storage_root: Path, output_format: str) -> None:
+    """Resolve a registered model_id@version to its record."""
+    guard = ModelGuard(storage_root=storage_root)
+    record = guard.resolve(model_id, version)
+
+    if record is None:
+        click.echo(f"Error: {model_id}@{version} is not registered", err=True)
+        sys.exit(EXIT_ERROR)
+
+    revocation = guard.is_revoked(model_id, version)
+    if output_format == "json":
+        payload = {
+            "model_id": record.model_id,
+            "version": record.version,
+            "artifact_digest": record.artifact_digest,
+            "uri": record.uri,
+            "revoked": revocation is not None,
+        }
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(f"URI    : {record.uri}")
+        click.echo(f"Digest : {record.artifact_digest}")
+        click.echo(f"Revoked: {'YES - ' + revocation.reason if revocation else 'no'}")
+
+
+@cli.command()
+@click.argument("model_id")
+@click.argument("version")
+@click.option("--actor", required=True)
+@click.option("--reason", required=True)
+@click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
+def revoke(model_id: str, version: str, actor: str, reason: str, storage_root: Path) -> None:
+    """Revoke a registered model version."""
+    guard = ModelGuard(storage_root=storage_root)
+    guard.revoke(model_id, version, actor=actor, reason=reason)
+    click.echo(f"Revoked {model_id}@{version}: {reason}")
+
+
+@cli.command()
+@click.argument("model_id")
+@click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def lineage(model_id: str, storage_root: Path, output_format: str) -> None:
+    """Show the full ancestor lineage for MODEL_ID."""
+    guard = ModelGuard(storage_root=storage_root)
+    events = guard.lineage(model_id)
+
+    if output_format == "json":
+        payload = [
+            {"subject": e.subject_id, "relationship": e.relationship, "object": e.object_id}
+            for e in events
+        ]
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        if not events:
+            click.echo(f"No recorded lineage for {model_id}")
+        for e in events:
+            click.echo(f"{e.subject_id} --{e.relationship}--> {e.object_id}")
+
+
+@cli.group()
+def provenance() -> None:
+    """Record and query model provenance relationships."""
+
+
+@provenance.command("record")
+@click.argument("subject_id")
+@click.argument("relationship")
+@click.argument("object_id")
+@click.option("--actor", required=True)
+@click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
+def provenance_record(
+    subject_id: str, relationship: str, object_id: str, actor: str, storage_root: Path
+) -> None:
+    """Record SUBJECT_ID --RELATIONSHIP--> OBJECT_ID.
+
+    RELATIONSHIP must be one of: DERIVED_FROM, TRAINED_ON,
+    FINE_TUNED_FROM, MERGED_FROM, QUANTIZED_FROM, EXPORTED_FROM,
+    PACKAGED_IN, SIGNED_BY, BUILT_BY, EVALUATED_BY, DEPLOYED_TO,
+    REVOKED_BY.
+    """
+    from modelguard.provenance.models import RelationshipType
+
+    valid = set(RelationshipType.__args__)  # type: ignore[attr-defined]
+    if relationship not in valid:
+        _fail(
+            ModelGuardError(f"Unknown relationship {relationship!r}. Valid: {sorted(valid)}"),
+            "text",
+        )
+
+    guard = ModelGuard(storage_root=storage_root)
+    guard.record_provenance(subject_id, relationship, object_id, actor=actor)  # type: ignore[arg-type]
+    click.echo(f"Recorded: {subject_id} --{relationship}--> {object_id}")
 
 
 def _fail(exc: ModelGuardError, output_format: str) -> None:
