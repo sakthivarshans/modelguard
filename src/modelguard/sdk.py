@@ -27,6 +27,9 @@ from modelguard.manifest.builder import DeclaredMetadata, build_manifest
 from modelguard.manifest.models import Manifest
 from modelguard.mbom.generator import DeclaredProvenance, generate_mbom
 from modelguard.mbom.models import MLBOM
+from modelguard.policy.engine import build_context, evaluate
+from modelguard.policy.loader import load_policy_file
+from modelguard.policy.models import PolicyDecisionResult
 from modelguard.provenance.graph import (
     children,
     find_deployments_using_revoked_model,
@@ -287,3 +290,44 @@ class ModelGuard:
                         if self.registry.is_revoked(candidate_id, v):
                             revoked_ids.add(candidate_id)
         return find_deployments_using_revoked_model(self.provenance_store, revoked_ids)
+
+    # -- policy ----------------------------------------------------
+
+    def check_policy(
+        self,
+        artifact_path: str | Path,
+        mbom_path: str | Path,
+        signature_path: str | Path,
+        policy_path: str | Path,
+    ) -> PolicyDecisionResult:
+        """Run verification, then evaluate a policy against the result.
+
+        This is the single call CI/CD should use: it combines
+        ``verify()`` (signature, digest, ML-BOM, revocation) with
+        policy-as-code evaluation and returns one explainable decision.
+        """
+        path = Path(artifact_path)
+        mbom = MLBOM.model_validate(json.loads(Path(mbom_path).read_text()))
+
+        verification = self.verify(path, mbom_path, signature_path)
+
+        # Reconstruct a Manifest good enough for policy rules (license,
+        # model_id, version) from the signature payload and mbom, since
+        # verify() only returns booleans, not the manifest itself.
+        envelope = SignatureEnvelope.model_validate(json.loads(Path(signature_path).read_text()))
+        manifest = Manifest(
+            artifact_type="file" if path.is_file() else "directory",
+            digest=verification.artifact_digest.split(":", 1)[-1],
+            model_id=envelope.payload.model_id,
+            version=envelope.payload.version,
+        )
+
+        policy = load_policy_file(Path(policy_path))
+        context = build_context(
+            manifest,
+            mbom,
+            signature_valid=verification.signature_valid,
+            mbom_valid=verification.mbom_valid,
+            revoked=verification.revoked,
+        )
+        return evaluate(context, policy)
