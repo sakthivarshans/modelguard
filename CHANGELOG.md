@@ -4,6 +4,60 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.3.0] - Phase 3: Policy Engine
+
+### Added
+
+- `modelguard.policy.models`: `Decision` enum (ALLOW, ALLOW_WITH_WARNINGS,
+  REVIEW_REQUIRED, QUARANTINE, DENY, REVOKED) ordered by severity,
+  `RuleConfig`, `PolicyDocument`, `RuleResult`, explainable
+  `PolicyDecisionResult` (`.explain()`).
+- `modelguard.policy.loader`: safe (`yaml.safe_load`-only) policy
+  loading with strict schema validation -- unknown top-level fields,
+  unknown `policy:` fields, and unknown rule names are all rejected
+  rather than silently ignored (`UnknownRuleError`,
+  `PolicyValidationError`).
+- `modelguard.policy.engine`: deterministic, pure-function evaluation
+  of five rules -- `require_valid_signature`, `require_ml_bom`,
+  `require_known_lineage`, `require_license`, `reject_revoked_models`
+  -- each with a configurable `on_fail` action
+  (`warn`/`review`/`quarantine`/`deny`). The overall decision is the
+  most severe triggered outcome. `reject_revoked_models` always
+  escalates to `REVOKED` regardless of its configured `on_fail`.
+- SDK: `ModelGuard.check_policy(artifact, mbom, signature, policy)`,
+  combining `verify()` with policy evaluation in one call.
+- CLI: `modelguard policy validate|check`, with per-decision exit
+  codes (0 allowed, 2 deny, 3 review required, 4 quarantine, 5
+  revoked, 1 error).
+- Example policies: `examples/policies/production.yaml`,
+  `examples/policies/development.yaml`.
+- 33 new tests (unit + security), bringing the suite to 113 tests.
+  `ruff check` and `mypy --strict` both remain clean.
+- New core dependency: PyYAML (policy files are YAML by design, per
+  the product document; `yaml.safe_load` is used exclusively).
+
+### Design decisions
+
+- Only five rules are implemented -- exactly the ones ModelGuard can
+  honestly evaluate today. Rules described in the product document
+  that depend on data ModelGuard does not yet produce (vulnerability
+  counts, risk classification, trusted-publisher lists) are not
+  accepted by the schema at all, rather than accepted and silently
+  treated as always-passing.
+- `reject_revoked_models` hardcodes its escalation to `REVOKED` in
+  engine code rather than trusting the policy author's `on_fail`
+  configuration for that one rule, since a misconfigured or malicious
+  policy setting it to `warn` would otherwise let a revoked model
+  through -- defeating the purpose of revocation.
+
+### Known limitations
+
+See `docs/limitations.md` and the Phase 3 addendum in
+`docs/security/threat-model.md`. In particular: no policy simulation/
+dry-run mode, and `ModelGuard.check_policy()` only considers
+license/lineage data from the ML-BOM (not the original manifest file),
+since it reconstructs a minimal manifest from the signature payload.
+
 ## [0.2.0] - Phase 2: Local Registry and Provenance
 
 ### Added
