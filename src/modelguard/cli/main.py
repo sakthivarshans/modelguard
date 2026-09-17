@@ -21,6 +21,8 @@ from modelguard.manifest.builder import DeclaredMetadata, build_manifest
 from modelguard.manifest.models import Manifest
 from modelguard.mbom.generator import generate_mbom
 from modelguard.mbom.models import MLBOM
+from modelguard.policy.loader import PolicyValidationError, load_policy_file
+from modelguard.policy.models import Decision
 from modelguard.sdk import ModelGuard
 from modelguard.signing.keys import generate_keypair, load_private_key, save_keypair
 from modelguard.signing.signer import sign_artifact
@@ -28,6 +30,18 @@ from modelguard.signing.signer import sign_artifact
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_DENIED = 2
+EXIT_REVIEW_REQUIRED = 3
+EXIT_QUARANTINE = 4
+EXIT_REVOKED = 5
+
+_DECISION_EXIT_CODES: dict[Decision, int] = {
+    Decision.ALLOW: EXIT_OK,
+    Decision.ALLOW_WITH_WARNINGS: EXIT_OK,
+    Decision.REVIEW_REQUIRED: EXIT_REVIEW_REQUIRED,
+    Decision.QUARANTINE: EXIT_QUARANTINE,
+    Decision.DENY: EXIT_DENIED,
+    Decision.REVOKED: EXIT_REVOKED,
+}
 
 _DEFAULT_STORAGE_ROOT = Path(".modelguard")
 
@@ -348,6 +362,84 @@ def provenance_record(
     guard = ModelGuard(storage_root=storage_root)
     guard.record_provenance(subject_id, relationship, object_id, actor=actor)  # type: ignore[arg-type]
     click.echo(f"Recorded: {subject_id} --{relationship}--> {object_id}")
+
+
+@cli.group()
+def policy() -> None:
+    """Load, validate, and evaluate policy-as-code documents."""
+
+
+@policy.command("validate")
+@click.argument("policy_path", type=click.Path(exists=True, path_type=Path))
+def policy_validate(policy_path: Path) -> None:
+    """Validate a policy YAML file's schema without evaluating it."""
+    try:
+        doc = load_policy_file(policy_path)
+    except PolicyValidationError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(EXIT_ERROR)
+
+    click.echo(f"Policy {doc.name!r} is valid (schema version {doc.version}).")
+    enabled = [name for name, cfg in doc.rules.items() if cfg.enabled]
+    click.echo(f"Enabled rules: {', '.join(enabled) if enabled else '(none)'}")
+
+
+@policy.command("check")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("--mbom", "mbom_path", type=click.Path(exists=True, path_type=Path), required=True)
+@click.option(
+    "--signature", "signature_path", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--policy",
+    "policy_file",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--storage-root",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Local registry root, to also check revocation status.",
+)
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def policy_check(
+    path: Path,
+    mbom_path: Path,
+    signature_path: Path,
+    policy_file: Path,
+    storage_root: Path | None,
+    output_format: str,
+) -> None:
+    """Verify PATH and evaluate it against a policy document.
+
+    Exit codes: 0 = ALLOW/ALLOW_WITH_WARNINGS, 2 = DENY,
+    3 = REVIEW_REQUIRED, 4 = QUARANTINE, 5 = REVOKED, 1 = error.
+    """
+    guard = ModelGuard(storage_root=storage_root)
+    try:
+        result = guard.check_policy(path, mbom_path, signature_path, policy_file)
+    except ModelGuardError as exc:
+        _fail(exc, output_format)
+
+    if output_format == "json":
+        payload = {
+            "decision": result.decision.value,
+            "policy_name": result.policy_name,
+            "policy_version": result.policy_version,
+            "subject": result.subject,
+            "evaluation_id": result.evaluation_id,
+            "timestamp": result.timestamp,
+            "failed_rules": [
+                {"rule": r.rule, "action": r.action, "message": r.message}
+                for r in result.failed_rules
+            ],
+        }
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(result.explain())
+
+    sys.exit(_DECISION_EXIT_CODES[result.decision])
 
 
 def _fail(exc: ModelGuardError, output_format: str) -> None:
