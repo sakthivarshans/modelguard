@@ -1,0 +1,21 @@
+# A permissive policy suitable for local development: only the two
+# checks that are almost always worth enforcing (a real signature, and
+# blocking anything explicitly revoked) are hard requirements.
+
+version: "1"
+
+policy:
+  name: development
+  environment: development
+
+rules:
+  require_valid_signature:
+    enabled: true
+    on_fail: deny
+
+  reject_revoked_models:
+    enabled: true
+    on_fail: deny
+
+  # require_ml_bom, require_license, and require_known_lineage are
+  # intentionally left unconfigured (disabled) here.
