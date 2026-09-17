@@ -4,6 +4,54 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.2.0] - Phase 2: Local Registry and Provenance
+
+### Added
+
+- `modelguard.audit.chain`: a generic hash-chained, tamper-evident
+  append-only log primitive, shared by the audit log, the registry's
+  revocation history, and the provenance store.
+- `modelguard.audit.log.LocalAuditLog` and `AuditEvent`.
+- `modelguard.registry`: `Registry` protocol, `LocalRegistry`
+  (register/resolve by name or digest/list versions/revoke/unrevoke),
+  `RegistryRecord`, `RevocationRecord`. Duplicate registration of an
+  existing `model_id`/`version` is rejected; registry identifiers are
+  validated against path traversal.
+- `modelguard.provenance`: `ProvenanceEvent`, `RelationshipType`,
+  `LocalProvenanceStore`, and graph queries `parents`, `children`,
+  `lineage`, `find_models_derived_from`,
+  `find_deployments_using_revoked_model` (cycle-safe).
+- SDK: `ModelGuard(storage_root=...)`, `register`, `resolve`,
+  `resolve_by_digest`, `revoke`, `is_revoked`, `record_provenance`,
+  `parents`, `children`, `lineage`, `find_models_derived_from`,
+  `find_deployments_using_revoked_model`.
+- `ModelGuard.verify()` is now revocation-aware: denies a revoked
+  model even when its signature and digest are still valid. Adds a
+  `revoked` field to `VerificationResult`.
+- CLI: `modelguard register|resolve|revoke|lineage|provenance record`,
+  and `modelguard verify --storage-root` for revocation-aware
+  verification.
+- 37 new tests (unit + security), bringing the suite to 80 tests.
+  `ruff check` and `mypy --strict` both remain clean.
+
+### Design decisions
+
+- Phase 2 is implemented as a **local, file-backed** registry and
+  provenance store behind `Protocol` interfaces, rather than the
+  FastAPI + PostgreSQL service described in the architecture document.
+  This follows the project's own MVP rule ("the first implementation
+  must work without external services") and keeps this phase testable
+  without a database. A PostgreSQL-backed `Registry` implementation is
+  future work and should be a drop-in adapter behind the same protocol.
+
+### Known limitations
+
+See `docs/limitations.md` and the Phase 2 addendum in
+`docs/security/threat-model.md`. In particular: hash-chain integrity
+is not verified automatically on every read (must call `.verify()`
+explicitly), tail-truncation of a hash-chained log is undetectable,
+and the local registry/provenance/audit files assume a single writer.
+
 ## [0.1.0] - Phase 1: Local Core
 
 ### Added
