@@ -4,16 +4,19 @@ ModelGuard is an open-source framework for AI/ML model supply-chain
 security: artifact integrity, provenance, ML-BOM generation, signing,
 verification, and (in later phases) policy enforcement.
 
-**Status: Phase 1 (local core).** This release supports a single
-local vertical slice:
+## Status
 
-```text
-inspect -> hash -> manifest -> mbom generate -> sign -> verify
-```
+**Phase 1 (local core):** inspect → hash → manifest → mbom generate → sign → verify.
 
-entirely on one machine, with no database, object storage, or network
-service required. See `docs/limitations.md` for what is explicitly
-out of scope so far.
+**Phase 2 (local registry + provenance):** register/resolve/revoke a
+model version, record and query lineage, revocation-aware verification.
+
+**Phase 3 (policy engine):** load a YAML policy document, evaluate a
+verified artifact against it, get a deterministic, explainable
+decision (`ALLOW` / `ALLOW_WITH_WARNINGS` / `REVIEW_REQUIRED` /
+`QUARANTINE` / `DENY` / `REVOKED`).
+
+See `docs/limitations.md` for what is explicitly out of scope so far.
 
 ## Quick start
 
@@ -21,7 +24,8 @@ out of scope so far.
 pip install -e ".[dev]"
 
 modelguard inspect ./examples/basic_verification/model
-modelguard manifest ./examples/basic_verification/model -o model.manifest.json
+modelguard manifest ./examples/basic_verification/model -o model.manifest.json \
+  --model-id toy-classifier --version 1.0.0 --license Apache-2.0
 modelguard mbom generate model.manifest.json -o model.bom.json
 modelguard keygen --identity dev@example.com --output-dir ./keys
 modelguard sign ./examples/basic_verification/model \
@@ -32,6 +36,31 @@ modelguard verify ./examples/basic_verification/model \
   --mbom model.bom.json --signature model.sig.json
 ```
 
+Register it, then check it against a policy:
+
+```bash
+modelguard register model.manifest.json model.bom.json \
+  --actor dev@example.com --storage-root ./.modelguard
+
+modelguard policy validate examples/policies/production.yaml
+modelguard policy check ./examples/basic_verification/model \
+  --mbom model.bom.json --signature model.sig.json \
+  --policy examples/policies/production.yaml \
+  --storage-root ./.modelguard
+```
+
+Revoke it and watch both `verify` and `policy check` react:
+
+```bash
+modelguard revoke toy-classifier 1.0.0 \
+  --actor security@example.com --reason "compromised base model" \
+  --storage-root ./.modelguard
+
+modelguard verify ./examples/basic_verification/model \
+  --mbom model.bom.json --signature model.sig.json --storage-root ./.modelguard
+echo "exit: $?"   # 2 (denied) -- revoked, even though the signature is still valid
+```
+
 ## Python SDK
 
 ```python
@@ -40,6 +69,23 @@ from modelguard import ModelGuard
 guard = ModelGuard()
 result = guard.verify("./model", "model.bom.json", "model.sig.json")
 result.raise_if_denied()
+```
+
+With a local registry configured, check a verified artifact against a policy:
+
+```python
+from modelguard import ModelGuard
+
+guard = ModelGuard(storage_root="./.modelguard")
+
+decision = guard.check_policy(
+    "./model", "model.bom.json", "model.sig.json", "examples/policies/production.yaml"
+)
+
+print(decision.explain())
+
+if not decision.decision.is_allowed:
+    raise SystemExit(f"Blocked: {decision.decision.value}")
 ```
 
 ## Development
