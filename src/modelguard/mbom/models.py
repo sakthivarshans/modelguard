@@ -25,6 +25,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 MBOM_SCHEMA_VERSION = "1"
 CYCLONEDX_SPEC_VERSION = "1.6"
+# Not imported from modelguard.__version__ to avoid a circular import
+# (modelguard/__init__.py -> sdk -> mbom). Kept in sync manually; a
+# packaging-metadata lookup (importlib.metadata) is a cleaner fix for
+# a later phase.
+_TOOL_VERSION = "0.2.0"
 
 
 class EvidenceLevel(str, Enum):
@@ -79,7 +84,7 @@ class MLBOMMetadata(BaseModel):
 
     timestamp: str
     tool_name: str = "modelguard"
-    tool_version: str = "0.1.0"
+    tool_version: str = _TOOL_VERSION
 
 
 class MLBOMComponent(BaseModel):
