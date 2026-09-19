@@ -4,6 +4,88 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.4.0] - Phase 4: Scanning
+
+### Added
+
+- `modelguard.scanning.models`: `Severity` (INFO/LOW/MEDIUM/HIGH/CRITICAL,
+  ordered, `.rank`), `Confidence` (LOW/MEDIUM/HIGH), `Finding`,
+  `ScanReport` (`.clean`, `.all_scanners_ok`, `.count(severity)`).
+- `modelguard.scanning.protocol.Scanner`: the plugin interface every
+  scanner implements. Explicitly forbids executing, importing, or
+  deserializing artifact content.
+- `modelguard.scanning._walk.iter_scannable_files`: a shared,
+  symlink-safe file walker. Unlike `modelguard.hashing.digest`, which
+  fails closed and raises on any symlink, scanning skips a symlink and
+  reports a LOW-severity `scan_skipped` finding instead, so one unsafe
+  entry does not abort the rest of the scan.
+- Three built-in scanners: `UnsafeSerializationScanner` (pickle
+  extension + pickle-protocol-header sniffing; never unpickles),
+  `SecretScanner` (a narrow, high-confidence pattern set -- AWS access
+  key IDs, PEM private key headers, GitHub PATs, Slack tokens; skips
+  oversized/binary files; never echoes matched secret text into a
+  finding), `MetadataCompletenessScanner` (informational-only: missing
+  license, lineage, or model identity).
+- `modelguard.scanning.run_scanners`: orchestrates `DEFAULT_SCANNERS`
+  (all three above) against an artifact, isolating each scanner in its
+  own try/except so a raising scanner is recorded as `"error"` rather
+  than crashing the run or being silently treated as "found nothing".
+- Two new policy rules: `max_critical_findings`, `max_high_findings`.
+  `RuleConfig` gained a `max_count` field for them. Both **fail
+  closed**: enabling either rule without a scan having run denies
+  rather than treating "no scan" as "zero findings" -- see
+  `PolicyEvaluationContext.scan_performed`.
+- SDK: `ModelGuard.scan(artifact, manifest=None, mbom=None)`.
+  `ModelGuard.check_policy(...)` now always runs a scan as part of
+  every policy check and feeds CRITICAL/HIGH finding counts into
+  `build_context()`.
+- CLI: `modelguard scan PATH [--manifest ...] [--mbom ...]
+  [--fail-on info|low|medium|high|critical] [--format json]`, with
+  text and JSON output and exit codes matching the existing
+  `verify`/`policy check` conventions (0 clean, 2 a blocking finding or
+  scanner error, 1 unexpected error).
+- `examples/policies/production.yaml` now enables `max_critical_findings`
+  (deny) and `max_high_findings` (review) at `max_count: 0`.
+- 49 new tests (unit + security), bringing the suite to 162 tests.
+  `ruff check` and `mypy --strict` both remain clean.
+
+### Design decisions
+
+- Scanners are format/pattern-level only, never behavioral: detecting
+  "this pickle's opcodes construct a dangerous object" would require
+  parsing (and is not far from executing) the pickle stream, which is
+  explicitly out of scope. The unsafe-serialization scanner reads at
+  most 8 bytes per file for its header sniff and never calls
+  `pickle.load` or any other deserializer.
+- The secret scanner is deliberately narrow (four pattern families)
+  rather than a general-purpose secret scanner with entropy analysis --
+  precision over recall, to keep the false-positive rate low enough
+  that a `max_critical_findings: 0` policy is usable in practice.
+- `iter_scannable_files` skips-and-reports a symlink rather than
+  failing closed the way `modelguard.hashing.digest` does. Hashing is
+  the security-critical identity computation and must never silently
+  proceed past unsafe input; scanning is best-effort defense-in-depth,
+  so aborting an entire scan over one symlink would throw away
+  legitimate findings elsewhere in the artifact for no security
+  benefit -- the symlink is still never followed either way.
+- `max_critical_findings`/`max_high_findings` fail closed on
+  `scan_performed=False` rather than defaulting to "0 findings, so
+  pass". A policy author who enables either rule is asking for
+  scan-backed evidence; silently treating "no scan happened" as "the
+  scan found nothing" would be exactly the kind of fake completeness
+  the project's engineering rules forbid.
+
+### Known limitations
+
+See `docs/limitations.md` and the Phase 4 addendum in
+`docs/security/threat-model.md`. In particular: no dependency
+scanning, no container scanning, no license-allowlist scanning, no
+opcode-level pickle analysis, no recursive archive inspection, and no
+suppression/status workflow for findings beyond a fixed `status="open"`
+field. Scan reports are not signed or otherwise cryptographically
+bound into the manifest/ML-BOM/signature chain -- they are local,
+unsigned observations.
+
 ## [0.3.0] - Phase 3: Policy Engine
 
 ### Added
