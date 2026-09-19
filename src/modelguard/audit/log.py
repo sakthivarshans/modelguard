@@ -26,6 +26,7 @@ AuditEventType = Literal[
     "model.revoked",
     "model.unrevoked",
     "provenance.event_recorded",
+    "deployment.admission",
 ]
 
 
