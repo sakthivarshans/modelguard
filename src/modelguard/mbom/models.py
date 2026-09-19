@@ -29,7 +29,7 @@ CYCLONEDX_SPEC_VERSION = "1.6"
 # (modelguard/__init__.py -> sdk -> mbom). Kept in sync manually; a
 # packaging-metadata lookup (importlib.metadata) is a cleaner fix for
 # a later phase.
-_TOOL_VERSION = "0.4.0"
+_TOOL_VERSION = "0.5.0"
 
 
 class EvidenceLevel(str, Enum):
