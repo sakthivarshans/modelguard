@@ -1,0 +1,97 @@
+# Example: gate a build on ModelGuard verification + policy.
+#
+# Copy to .github/workflows/verify-model.yml and edit the marked values.
+# NOT run in this repository's CI: treat it as a starting point, and
+# test it in your own repo before relying on it.
+#
+# Exit codes of `modelguard policy check` (any non-zero fails the job):
+#   0 ALLOW / ALLOW_WITH_WARNINGS   2 DENY   3 REVIEW_REQUIRED
+#   4 QUARANTINE   5 REVOKED   1 error (bad input/config)
+#
+# SECURITY: what the pull-request author controls, they can subvert.
+#   * The trusted key fingerprint comes from a repository/organization
+#     *variable*, not from a file in the PR -- otherwise an attacker
+#     swaps the fingerprint for their own key.
+#   * The policy file is read from the BASE commit of the PR, not the
+#     PR head -- otherwise an attacker weakens the policy in the same PR.
+#   * This uses `pull_request`, never `pull_request_target`, so
+#     untrusted PR code never runs with secrets or write permissions.
+#   * Third-party actions below are tag-pinned for readability; pin them
+#     to full commit SHAs in your organization.
+
+name: verify-model
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # EDIT: full commit SHA of the ModelGuard revision you have reviewed.
+  MODELGUARD_REF: REPLACE_WITH_FULL_COMMIT_SHA
+  # EDIT: paths of the model and its sidecar files in your repository.
+  MODEL_PATH: models/classifier
+  MBOM_PATH: models/classifier.bom.json
+  SIGNATURE_PATH: models/classifier.sig.json
+  POLICY_PATH: policies/production.yaml
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check the example was configured
+        shell: bash
+        run: |
+          case "$MODELGUARD_REF" in
+            REPLACE_WITH_*) echo "Set MODELGUARD_REF to a reviewed commit SHA." >&2; exit 1 ;;
+          esac
+          if [ -z "${{ vars.MODELGUARD_TRUSTED_FINGERPRINT }}" ]; then
+            echo "Set the MODELGUARD_TRUSTED_FINGERPRINT repository variable." >&2
+            exit 1
+          fi
+
+      - name: Check out the change under review
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # Model weights are often stored with Git LFS.
+          lfs: true
+
+      - name: Check out policies from the base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted
+          sparse-checkout: policies
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ModelGuard at a pinned revision
+        shell: bash
+        run: pip install "git+https://github.com/sakthivarshans/modelguard.git@${MODELGUARD_REF}"
+
+      - name: Verify signature, integrity, scan, and policy
+        shell: bash
+        run: |
+          modelguard policy check "$MODEL_PATH" \
+            --mbom "$MBOM_PATH" \
+            --signature "$SIGNATURE_PATH" \
+            --policy "trusted/$POLICY_PATH" \
+            --trusted-fingerprint "${{ vars.MODELGUARD_TRUSTED_FINGERPRINT }}" \
+            --format json > modelguard-result.json || status=$?
+          cat modelguard-result.json
+          exit "${status:-0}"
+
+      - name: Keep the decision as a build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modelguard-result
+          path: modelguard-result.json
