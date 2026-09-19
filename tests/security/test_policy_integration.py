@@ -100,13 +100,22 @@ def test_check_policy_reflects_tampered_artifact_as_denial(tmp_path: Path) -> No
     guard = ModelGuard()
     result = guard.check_policy(artifact, mbom_path, sig_path, policy_path)
 
-    # Tampering breaks the digest match, which verify() folds into
-    # "not allowed" -- but note: signature_valid stays True (the
-    # signature bytes are still cryptographically valid), so a policy
-    # that only requires a valid signature would not catch this on its
-    # own. Confirm that check_policy still surfaces the tamper via the
-    # underlying verify() call being reflected correctly downstream.
-    assert result.decision == Decision.ALLOW  # signature rule alone doesn't check digest
+    # Regression (found in Phase 5): before 0.5.0 this returned ALLOW,
+    # because signature_valid stays True for a tampered artifact (the
+    # signature bytes are still valid) and no rule looked at the digest.
+    # Integrity is now an unconditional gate, not a policy rule.
+    assert result.decision == Decision.DENY
+    assert [r.rule for r in result.failed_rules] == ["artifact_integrity"]
+
+
+def test_tampered_artifact_is_denied_even_by_an_empty_policy(tmp_path: Path) -> None:
+    artifact, mbom_path, sig_path = _signed_fixture(tmp_path)
+    policy_path = _policy(tmp_path, "policy:\n  name: permissive\nrules: {}\n")
+    artifact.write_bytes(b"tampered")
+
+    result = ModelGuard().check_policy(artifact, mbom_path, sig_path, policy_path)
+
+    assert result.decision == Decision.DENY
 
 
 def test_check_policy_denies_revoked_model_regardless_of_configured_rules(tmp_path: Path) -> None:
