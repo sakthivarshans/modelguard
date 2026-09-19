@@ -23,6 +23,7 @@ from modelguard.mbom.generator import generate_mbom
 from modelguard.mbom.models import MLBOM
 from modelguard.policy.loader import PolicyValidationError, load_policy_file
 from modelguard.policy.models import Decision
+from modelguard.scanning import Finding, ScanReport, Severity, run_scanners
 from modelguard.sdk import ModelGuard
 from modelguard.signing.keys import generate_keypair, load_private_key, save_keypair
 from modelguard.signing.signer import sign_artifact
@@ -42,6 +43,22 @@ _DECISION_EXIT_CODES: dict[Decision, int] = {
     Decision.DENY: EXIT_DENIED,
     Decision.REVOKED: EXIT_REVOKED,
 }
+
+_SEVERITY_CHOICES: dict[str, Severity] = {
+    "info": Severity.INFO,
+    "low": Severity.LOW,
+    "medium": Severity.MEDIUM,
+    "high": Severity.HIGH,
+    "critical": Severity.CRITICAL,
+}
+
+_SEVERITY_DISPLAY_ORDER: tuple[Severity, ...] = (
+    Severity.CRITICAL,
+    Severity.HIGH,
+    Severity.MEDIUM,
+    Severity.LOW,
+    Severity.INFO,
+)
 
 _DEFAULT_STORAGE_ROOT = Path(".modelguard")
 
@@ -243,6 +260,117 @@ def verify(
             click.echo(f"  reason: {reason}")
 
     sys.exit(EXIT_OK if result.allowed else EXIT_DENIED)
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--manifest",
+    "manifest_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Manifest JSON, so the metadata-completeness scanner has declared fields to check.",
+)
+@click.option(
+    "--mbom",
+    "mbom_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="ML-BOM JSON, so the metadata-completeness scanner has declared fields to check.",
+)
+@click.option(
+    "--fail-on",
+    type=click.Choice(list(_SEVERITY_CHOICES)),
+    default="high",
+    help="Exit non-zero if any finding at or above this severity exists.",
+)
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def scan(
+    path: Path,
+    manifest_path: Path | None,
+    mbom_path: Path | None,
+    fail_on: str,
+    output_format: str,
+) -> None:
+    """Scan an artifact for unsafe serialization, exposed secrets, and
+    incomplete metadata.
+
+    --manifest/--mbom are optional; omitting them still runs the
+    unsafe-serialization and secret scanners, but the metadata-
+    completeness scanner has nothing to check and reports nothing.
+
+    Exit code 0 if every scanner ran successfully and no finding at or
+    above --fail-on (default: high) exists; 2 if a scanner errored or
+    such a finding exists; 1 on an unexpected error (missing file,
+    malformed manifest/ML-BOM JSON).
+    """
+    manifest_obj: Manifest | None = None
+    mbom_obj: MLBOM | None = None
+    try:
+        if manifest_path is not None:
+            manifest_obj = Manifest.model_validate(json.loads(manifest_path.read_text()))
+        if mbom_path is not None:
+            mbom_obj = MLBOM.model_validate(json.loads(mbom_path.read_text()))
+        report = run_scanners(path, manifest_obj, mbom_obj)
+    except ModelGuardError as exc:
+        _fail(exc, output_format)
+
+    threshold = _SEVERITY_CHOICES[fail_on]
+    blocking = [f for f in report.findings if f.severity.rank >= threshold.rank]
+
+    if output_format == "json":
+        payload = {
+            "artifact_digest": report.artifact_digest,
+            "scan_id": report.scan_id,
+            "scanner_statuses": report.scanner_statuses,
+            "scanner_errors": report.scanner_errors,
+            "clean": report.clean,
+            "findings": [_finding_to_dict(f) for f in report.findings],
+        }
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        _print_scan_report_text(report)
+
+    if not report.all_scanners_ok or blocking:
+        sys.exit(EXIT_DENIED)
+    sys.exit(EXIT_OK)
+
+
+def _finding_to_dict(f: Finding) -> dict[str, str | None]:
+    return {
+        "finding_id": f.finding_id,
+        "scanner": f.scanner,
+        "category": f.category,
+        "severity": f.severity.value,
+        "confidence": f.confidence.value,
+        "component": f.component,
+        "message": f.message,
+        "remediation": f.remediation,
+        "evidence": f.evidence,
+        "status": f.status,
+    }
+
+
+def _print_scan_report_text(report: ScanReport) -> None:
+    click.echo(f"Artifact digest: {report.artifact_digest}")
+    statuses = ", ".join(f"{name}={status}" for name, status in report.scanner_statuses.items())
+    click.echo(f"Scanners       : {statuses}")
+    for name, error in report.scanner_errors.items():
+        click.echo(f"  {name} ERROR: {error}")
+
+    if not report.findings:
+        click.echo("Findings       : none")
+        return
+
+    counts = {sev: report.count(sev) for sev in _SEVERITY_DISPLAY_ORDER}
+    summary = ", ".join(f"{sev.value}={n}" for sev, n in counts.items() if n)
+    click.echo(f"Findings       : {len(report.findings)} ({summary})")
+
+    ordered = sorted(report.findings, key=lambda f: -f.severity.rank)
+    for f in ordered:
+        click.echo(f"  [{f.severity.value:<8}] {f.scanner}: {f.component}: {f.message}")
+        if f.remediation:
+            click.echo(f"             remediation: {f.remediation}")
 
 
 @cli.command()
