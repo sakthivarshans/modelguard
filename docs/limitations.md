@@ -143,8 +143,9 @@ not assume it works.
   yet parse SafeTensors headers, ONNX graphs, or Hugging Face
   `config.json` semantics. Any file or directory can be hashed, but no
   format-aware metadata extraction happens automatically.
-- **No async API**, no verification caching, no CI/CD templates, no
-  Docker/Kubernetes integration.
+- **No async API.** No Kubernetes integration (no admission webhook,
+  no sidecar). See the Phase 5 section for what CI/Docker/admission
+  support actually is.
 - **No multi-file archive extraction** (zip, tar). Only plain files
   and directories already present on disk.
 - **The hash-chained audit/provenance/revocation logs detect tail
@@ -161,13 +162,15 @@ not assume it works.
   `0600`). Losing control of the filesystem means losing control of
   the key. This is documented as a development-only mechanism; do not
   use `modelguard keygen` for anything you would call production.
-- There is no trust-root concept yet: `modelguard verify` will accept
-  *any* valid signature from *any* public key embedded in the
-  signature file, as long as the signature and digests check out. It
-  does not yet check "is this signer someone I trust". Wiring in an
-  explicit, caller-supplied trusted-public-key check is the natural
-  next security-relevant piece of work, ahead of the full policy
-  engine.
+- **Trust roots are opt-in (Phase 5).** Without
+  `--trusted-fingerprint` / `trusted_key_fingerprints=`, `verify` still
+  accepts a valid signature from *any* key embedded in the signature
+  file -- an attacker can re-sign a tampered model with their own key
+  and it verifies. `VerificationResult.signer_trusted` is `None` in
+  that case and the CLI prints `Signer: NOT CHECKED`. The
+  `require_trusted_signer` rule and `admit()` both fail closed when no
+  trust roots are configured. See the Phase 5 section for what trust
+  roots do and do not cover.
 - Symlinks are rejected outright rather than safely resolved. This is
   a conservative, fail-closed choice, not a statement that symlink
   support is unimportant -- see the design note in
@@ -186,3 +189,86 @@ not assume it works.
   and there is no tamper-evidence on a scan report the way there is on
   the audit/provenance/registry logs. A scan report should be treated
   as a local, unsigned observation, not an attestation.
+
+## Phase 5: CI/CD, caching, admission, trust roots
+
+### Implemented
+
+- `require_trusted_signer` policy rule and trusted key fingerprints
+  (SHA-256 of the raw Ed25519 public key), on the SDK and both CLI
+  commands. Multiple fingerprints may be trusted at once (the
+  mechanism for rotation: add the new one, later remove the old).
+- An **unconditional integrity gate**: a digest mismatch is always a
+  `DENY` in policy evaluation, independent of policy content.
+- Opt-in digest cache (`ModelGuard(cache_dir=...)`, `--cache-dir`).
+- `modelguard.admission.admit()`, a fail-closed, optionally audited
+  decision function.
+- Examples: GitHub Actions workflow, Docker build+startup pattern,
+  `deploy_gate.py`.
+
+### Not implemented / limits (be aware before relying on these)
+
+- **Trust roots are fingerprints of raw local keys.** There is no
+  expiry, no per-key revocation (remove the fingerprint), no key
+  rotation tooling, and no binding between the human-readable
+  `signer_identity` string and the key: the identity is still an
+  unverified claim. Sigstore/KMS identity is a later phase. A
+  fingerprint is only as trustworthy as the channel you obtained it
+  through.
+- **The digest cache trusts filesystem metadata.** A hit means "size,
+  mtime, ctime, inode and device are unchanged and old enough", not "the
+  bytes were re-read". It is unsound against an attacker with root, raw
+  block-device access, or control of the system clock; writes through a
+  shared `mmap` may not update timestamps promptly on some systems;
+  network/FUSE filesystems with attribute caching and Windows (where
+  `st_ctime` is creation time) are unsupported -- the cache is bypassed
+  off POSIX and for inode 0, but is *not* able to detect a network
+  filesystem that reports stale attributes. It defends the cache *file*
+  against other local users (rejects symlinks, foreign owners, group- or
+  world-writable files, oversized or corrupt content) but not against
+  the same user forging a consistent entry. Keep `--cache-dir`
+  somewhere the artifact's supplier cannot write. Do not enable it on
+  hosts where the model directory is writable by an untrusted party
+  *and* you cannot tolerate this assumption: leave it off (the default).
+- **Only digest computation is cached.** Scans are re-run every time
+  (they are cheap next to hashing; measured). Signature, ML-BOM,
+  trust, revocation and policy are never cached.
+- **Check-to-use window.** `verify`/`admit` check the artifact at one
+  instant. If the files can change before the model is loaded (writable
+  volume, swapped mount, attacker with write access), the check does
+  not protect the load. Mitigations are deployment-level (read-only
+  root filesystem, immutable image layers, verifying from the same file
+  descriptors you load) and out of scope here.
+- **Revocation is still opt-in.** It is consulted only when a
+  `storage_root` is configured *and* the signature carries a
+  `model_id`/`version`. `VerificationResult.revocation_checked` and
+  `AdmissionDecision.revocation_checked` say whether it happened, but
+  the `reject_revoked_models` rule itself still reports "not revoked"
+  when nothing was checked -- a known imprecision in its message. A
+  deploy target with no access to a registry gets no revocation
+  protection until the PostgreSQL/registry-service phase.
+- **`admit()` is a function, not an enforcement point.** Nothing stops
+  a caller ignoring `admitted=False`. There is no Kubernetes webhook,
+  no server, no rate limiting. The admission audit log is the same
+  single-writer, tail-truncation-blind JSONL chain as the other logs.
+- **The CI and Docker examples are untested against real runners.** The
+  workflow is validated statically (YAML parse, permissions, trust
+  wiring); the Dockerfile statically; `entrypoint.sh` and
+  `deploy_gate.py` are exercised behaviorally in unit tests. Nobody has
+  run the workflow on GitHub or built the image in this repository's CI.
+  Actions are tag-pinned (pin to SHAs yourself) and the install line
+  needs a reviewed commit SHA because ModelGuard is not published to a
+  package index.
+- **Image labels are not evidence.** `org.modelguard.*` labels in the
+  Docker example are informational claims by the image builder. There is
+  no `verification.status` label on purpose.
+- **In-image verification is only as strong as what the attacker can
+  change.** If they can rewrite the model they can usually also rewrite
+  the BOM, signature, and policy in the same writable layer. Supply the
+  trusted fingerprint (and ideally the policy) from deployment
+  configuration outside the image, as the example entrypoint does for
+  the fingerprint.
+- `policy.evaluate()` called directly with a hand-built context that
+  leaves `artifact_digest_matches=None` skips the integrity gate (kept
+  for compatibility with pre-0.5.0 hand-built contexts). `build_context`
+  and `check_policy` always set it. Prefer them.
