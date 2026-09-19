@@ -7,6 +7,7 @@ from modelguard.signing.keys import (
     save_keypair,
 )
 from modelguard.signing.signer import sign_artifact
+from modelguard.signing.trust import normalize_fingerprints, public_key_fingerprint
 from modelguard.signing.verifier import (
     TamperCheckResult,
     check_artifact_digest,
@@ -26,6 +27,8 @@ __all__ = [
     "generate_keypair",
     "load_private_key",
     "load_public_key",
+    "normalize_fingerprints",
+    "public_key_fingerprint",
     "save_keypair",
     "sign_artifact",
     "verify_artifact",
