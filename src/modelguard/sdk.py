@@ -16,12 +16,14 @@ rather than through this facade.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from modelguard.exceptions import ModelGuardError, VerificationDenied
+from modelguard.cache import CachedHasher
+from modelguard.exceptions import ModelGuardError, TrustConfigurationError, VerificationDenied
 from modelguard.hashing.digest import ArtifactDigest, hash_artifact
 from modelguard.manifest.builder import DeclaredMetadata, build_manifest
 from modelguard.manifest.models import Manifest
@@ -45,6 +47,7 @@ from modelguard.scanning import ScanReport, Severity, run_scanners
 from modelguard.signing.envelope import SignatureEnvelope
 from modelguard.signing.keys import LocalKeyPair, load_public_key
 from modelguard.signing.signer import sign_artifact
+from modelguard.signing.trust import normalize_fingerprints, public_key_fingerprint
 from modelguard.signing.verifier import (
     check_artifact_digest,
     check_mbom_digest,
@@ -56,11 +59,18 @@ from modelguard.signing.verifier import (
 class VerificationResult:
     """Structured outcome of ``ModelGuard.verify()``.
 
-    ``allowed`` reflects Phase 1's scope only: valid signature + digest
-    match against the supplied public key and ML-BOM. It does not yet
-    reflect policy evaluation, revocation, or scanning -- those are
-    added in later phases and will be additional fields here, not a
-    change to this field's meaning.
+    ``allowed`` means: the signature is cryptographically valid, the
+    artifact on disk matches the signed digest, the ML-BOM matches, the
+    model is not revoked (when a registry is configured), and -- when
+    trusted key fingerprints are configured -- the signing key is one
+    of them. It does not reflect policy evaluation or scanning.
+
+    Read ``signer_trusted`` alongside ``allowed``: when it is ``None``
+    no trust roots were configured, so ``allowed`` says nothing about
+    *who* signed (anyone can sign with a freshly generated key).
+    Likewise ``revocation_checked`` is ``False`` when no registry was
+    consulted, in which case ``revoked=False`` means "not checked",
+    not "checked and clear".
     """
 
     allowed: bool
@@ -69,10 +79,31 @@ class VerificationResult:
     mbom_valid: bool
     revoked: bool = False
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    # Fail-closed defaults: a result constructed without these facts
+    # never claims integrity or trust.
+    digest_matches: bool = False
+    signer_trusted: bool | None = None
+    revocation_checked: bool = False
+    digest_from_cache: bool = False
 
     def raise_if_denied(self) -> None:
         if not self.allowed:
             raise VerificationDenied(list(self.reasons))
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyCheck:
+    """A policy decision together with the evidence it was based on.
+
+    Returned by ``ModelGuard.check_policy_detailed()``. Deployment
+    admission needs the verification facts (digest, trust, revocation
+    coverage, cache use) alongside the decision, and a bare
+    ``PolicyDecisionResult`` does not carry them.
+    """
+
+    decision: PolicyDecisionResult
+    verification: VerificationResult
+    scan_report: ScanReport
 
 
 class ModelGuard:
@@ -84,10 +115,37 @@ class ModelGuard:
     Phase 1's inspect/sign/verify workflow needs no persistent state;
     pass it (or call the registry-touching methods without it) and a
     clear error explains what to configure.
+
+    ``trusted_key_fingerprints`` are the SHA-256 fingerprints of the
+    public keys whose signatures the caller accepts (see
+    ``modelguard.signing.trust``). Leave it ``None`` and no signer is
+    considered trusted; ``verify()`` still works but reports
+    ``signer_trusted=None``. An empty collection raises
+    ``TrustConfigurationError``.
+
+    ``cache_dir`` opts in to the local digest cache
+    (``modelguard.cache``); nothing is written to disk for caching
+    unless it is set.
     """
 
-    def __init__(self, storage_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        storage_root: str | Path | None = None,
+        *,
+        cache_dir: str | Path | None = None,
+        trusted_key_fingerprints: Iterable[str] | None = None,
+    ) -> None:
         self._storage_root = Path(storage_root) if storage_root else None
+        self._hasher: CachedHasher | None = CachedHasher(Path(cache_dir)) if cache_dir else None
+        self._trusted: frozenset[str] | None = (
+            normalize_fingerprints(trusted_key_fingerprints)
+            if trusted_key_fingerprints is not None
+            else None
+        )
+
+    @property
+    def trusted_key_fingerprints(self) -> frozenset[str] | None:
+        return self._trusted
 
     @property
     def registry(self) -> LocalRegistry:
@@ -158,8 +216,18 @@ class ModelGuard:
                 "the signature."
             )
 
+        digest_from_cache = False
+
+        def _hash(target: Path) -> ArtifactDigest:
+            nonlocal digest_from_cache
+            if self._hasher is None:
+                return hash_artifact(target)
+            outcome = self._hasher.hash(target)
+            digest_from_cache = outcome.from_cache
+            return outcome.digest
+
         try:
-            tamper_result = check_artifact_digest(path, envelope)
+            tamper_result = check_artifact_digest(path, envelope, _hash)
             digest_matches = tamper_result.matches
             current_digest = tamper_result.current_digest
             if not digest_matches:
@@ -173,7 +241,23 @@ class ModelGuard:
             current_digest = envelope.payload.artifact_digest
             reasons.append(str(exc))
 
-        allowed = signature_valid and mbom_valid and digest_matches
+        # Trust roots are checked against the key that actually verified
+        # the signature, and only when configured. ``None`` (not
+        # configured) is reported as such, never as trusted.
+        signer_trusted: bool | None = None
+        if self._trusted is not None:
+            try:
+                key_fingerprint = public_key_fingerprint(envelope.public_key)
+            except TrustConfigurationError:
+                key_fingerprint = ""
+            signer_trusted = signature_valid and key_fingerprint in self._trusted
+            if not signer_trusted and signature_valid:
+                reasons.append(
+                    f"The signing key (fingerprint {key_fingerprint or 'unreadable'}) is not in "
+                    "the configured set of trusted key fingerprints."
+                )
+
+        allowed = signature_valid and mbom_valid and digest_matches and signer_trusted is not False
 
         # If a local registry is configured and this artifact is
         # registered under a model_id, a revocation of that version
@@ -182,7 +266,9 @@ class ModelGuard:
         # fact layered on top of, not a replacement for, cryptographic
         # integrity.
         revoked = False
+        revocation_checked = False
         if self._storage_root is not None and envelope.payload.model_id and envelope.payload.version:
+            revocation_checked = True
             revocation = self.registry.is_revoked(
                 envelope.payload.model_id, envelope.payload.version
             )
@@ -201,6 +287,10 @@ class ModelGuard:
             mbom_valid=mbom_valid,
             revoked=revoked,
             reasons=tuple(reasons),
+            digest_matches=digest_matches,
+            signer_trusted=signer_trusted,
+            revocation_checked=revocation_checked,
+            digest_from_cache=digest_from_cache,
         )
 
     def load_public_key(self, path: str | Path) -> Ed25519PublicKey:
@@ -322,13 +412,29 @@ class ModelGuard:
         the combined result.
 
         This is the single call CI/CD should use: it combines
-        ``verify()`` (signature, digest, ML-BOM, revocation) with a
-        scan (so ``max_critical_findings``/``max_high_findings`` rules
+        ``verify()`` (signature, digest, ML-BOM, trust, revocation) with
+        a scan (so ``max_critical_findings``/``max_high_findings`` rules
         have real finding counts to evaluate) and policy-as-code
-        evaluation, returning one explainable decision. A policy that
-        does not enable either count-based rule pays the cost of a
-        scan but is otherwise unaffected -- scanning always runs here
-        so that enabling those rules later requires no code changes.
+        evaluation, returning one explainable decision. A digest
+        mismatch always yields DENY regardless of the policy -- see
+        ``modelguard.policy.engine.evaluate``.
+
+        Use ``check_policy_detailed()`` if you also need the
+        verification facts behind the decision.
+        """
+        return self.check_policy_detailed(
+            artifact_path, mbom_path, signature_path, policy_path
+        ).decision
+
+    def check_policy_detailed(
+        self,
+        artifact_path: str | Path,
+        mbom_path: str | Path,
+        signature_path: str | Path,
+        policy_path: str | Path,
+    ) -> PolicyCheck:
+        """Like ``check_policy`` but also returns the ``VerificationResult``
+        and ``ScanReport`` the decision was based on.
         """
         path = Path(artifact_path)
         mbom = MLBOM.model_validate(json.loads(Path(mbom_path).read_text()))
@@ -346,7 +452,17 @@ class ModelGuard:
             version=envelope.payload.version,
         )
 
-        scan_report = self.scan(path, manifest, mbom)
+        # Reuse the digest verify() just computed instead of hashing the
+        # artifact a second time -- but only when it really is the
+        # digest of what is on disk. If hashing failed or mismatched,
+        # ``artifact_digest`` may be the *claimed* digest from the
+        # signature, which must never label a scan report.
+        scan_report = run_scanners(
+            path,
+            manifest,
+            mbom,
+            artifact_digest=verification.artifact_digest if verification.digest_matches else None,
+        )
 
         policy = load_policy_file(Path(policy_path))
         context = build_context(
@@ -355,8 +471,14 @@ class ModelGuard:
             signature_valid=verification.signature_valid,
             mbom_valid=verification.mbom_valid,
             revoked=verification.revoked,
+            artifact_digest_matches=verification.digest_matches,
+            signer_trusted=verification.signer_trusted,
             scan_performed=True,
             critical_finding_count=scan_report.count(Severity.CRITICAL),
             high_finding_count=scan_report.count(Severity.HIGH),
         )
-        return evaluate(context, policy)
+        return PolicyCheck(
+            decision=evaluate(context, policy),
+            verification=verification,
+            scan_report=scan_report,
+        )
