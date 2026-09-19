@@ -34,3 +34,18 @@ rules:
   require_known_lineage:
     enabled: true
     on_fail: review
+
+  # Phase 4: gate on scanner findings. modelguard.check_policy() (and
+  # `modelguard policy check`) always runs a scan, so these rules have
+  # real finding counts to evaluate -- enabling either one without a
+  # scan having run would fail closed (DENY) rather than pass, see
+  # docs/security/threat-model.md.
+  max_critical_findings:
+    enabled: true
+    on_fail: deny
+    max_count: 0
+
+  max_high_findings:
+    enabled: true
+    on_fail: review
+    max_count: 0
