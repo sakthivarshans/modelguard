@@ -24,6 +24,13 @@ engine via two new count-based rules (`max_critical_findings`,
 `max_high_findings`). `modelguard.check_policy()` now always scans as
 part of every policy check.
 
+**Phase 5 (CI/CD, caching, admission, trust roots):** explicit trusted
+signer fingerprints, an opt-in digest cache, a fail-closed admission
+hook (`modelguard.admission.admit`), and CI / Docker examples under
+`examples/`. Phase 5 also fixes a serious bug: **in 0.3.0 and 0.4.0,
+`modelguard policy check` allowed tampered artifacts** (only
+`modelguard verify` caught them). See the 0.5.0 CHANGELOG entry.
+
 See `docs/limitations.md` for what is explicitly out of scope so far.
 
 ## Quick start
