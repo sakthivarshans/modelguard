@@ -21,6 +21,7 @@ from modelguard.policy.models import (
     Decision,
     PolicyDecisionResult,
     PolicyDocument,
+    RuleConfig,
     RuleResult,
 )
 
@@ -42,6 +43,16 @@ class PolicyEvaluationContext:
     revoked: bool
     has_license: bool
     has_declared_lineage: bool
+    # Phase 4: scanner-derived facts. ``scan_performed`` defaults to
+    # False so any context built without the new keyword arguments
+    # (e.g. an older caller, or a test written before Phase 4)
+    # continues to behave exactly as it did in Phase 3 for the two new
+    # rules: enabling either of them without ever running a scan fails
+    # closed rather than silently passing -- see the two _check_max_*
+    # functions below.
+    scan_performed: bool = False
+    critical_finding_count: int = 0
+    high_finding_count: int = 0
 
 
 def build_context(
@@ -51,9 +62,13 @@ def build_context(
     signature_valid: bool,
     mbom_valid: bool,
     revoked: bool,
+    scan_performed: bool = False,
+    critical_finding_count: int = 0,
+    high_finding_count: int = 0,
 ) -> PolicyEvaluationContext:
-    """Build a context from a manifest, ML-BOM, and the boolean results
-    already computed by ``ModelGuard.verify()``.
+    """Build a context from a manifest, ML-BOM, and the boolean/count
+    results already computed by ``ModelGuard.verify()`` and
+    ``ModelGuard.scan()``.
     """
     subject = f"{manifest.model_id or 'unknown'}@{manifest.version or 'unknown'}"
     has_license = bool(manifest.license or mbom.modelguard.license)
@@ -65,10 +80,15 @@ def build_context(
         revoked=revoked,
         has_license=has_license,
         has_declared_lineage=has_lineage,
+        scan_performed=scan_performed,
+        critical_finding_count=critical_finding_count,
+        high_finding_count=high_finding_count,
     )
 
 
-def _check_require_valid_signature(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
+def _check_require_valid_signature(
+    ctx: PolicyEvaluationContext, config: RuleConfig
+) -> tuple[bool, str]:
     if ctx.signature_valid:
         return True, "A valid signature was found."
     return False, (
@@ -78,7 +98,7 @@ def _check_require_valid_signature(ctx: PolicyEvaluationContext) -> tuple[bool, 
     )
 
 
-def _check_require_ml_bom(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
+def _check_require_ml_bom(ctx: PolicyEvaluationContext, config: RuleConfig) -> tuple[bool, str]:
     if ctx.mbom_valid:
         return True, "A matching ML-BOM was supplied."
     return False, (
@@ -88,7 +108,9 @@ def _check_require_ml_bom(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
     )
 
 
-def _check_require_known_lineage(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
+def _check_require_known_lineage(
+    ctx: PolicyEvaluationContext, config: RuleConfig
+) -> tuple[bool, str]:
     if ctx.has_declared_lineage:
         return True, "The ML-BOM declares at least one parent model."
     return False, (
@@ -98,7 +120,7 @@ def _check_require_known_lineage(ctx: PolicyEvaluationContext) -> tuple[bool, st
     )
 
 
-def _check_require_license(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
+def _check_require_license(ctx: PolicyEvaluationContext, config: RuleConfig) -> tuple[bool, str]:
     if ctx.has_license:
         return True, "A license is declared."
     return False, (
@@ -107,18 +129,72 @@ def _check_require_license(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
     )
 
 
-def _check_reject_revoked_models(ctx: PolicyEvaluationContext) -> tuple[bool, str]:
+def _check_reject_revoked_models(
+    ctx: PolicyEvaluationContext, config: RuleConfig
+) -> tuple[bool, str]:
     if not ctx.revoked:
         return True, "The model is not revoked."
     return False, "The model has been revoked."
 
 
-_RULE_CHECKS: dict[str, Callable[[PolicyEvaluationContext], tuple[bool, str]]] = {
+def _check_max_critical_findings(
+    ctx: PolicyEvaluationContext, config: RuleConfig
+) -> tuple[bool, str]:
+    # Fail closed: a rule that is enabled but has no scan to check
+    # against must NOT silently pass as if zero findings were found.
+    # Silently treating "no scan ran" as "zero findings" would be
+    # exactly the kind of fake completeness the project's engineering
+    # rules forbid -- a policy author who enables this rule is asking
+    # for scan-backed evidence, and none exists yet.
+    if not ctx.scan_performed:
+        return False, (
+            "max_critical_findings is enabled but no scan was performed. Expected: a "
+            "scan report to check finding counts against. Suggested action: ensure "
+            "ModelGuard.check_policy() (which always scans) is used, or otherwise pass "
+            "scan_performed=True with real finding counts to build_context()."
+        )
+    if ctx.critical_finding_count <= config.max_count:
+        return True, (
+            f"{ctx.critical_finding_count} CRITICAL finding(s) found, "
+            f"within the configured limit of {config.max_count}."
+        )
+    return False, (
+        f"{ctx.critical_finding_count} CRITICAL finding(s) found, exceeding the "
+        f"configured limit of {config.max_count}. Expected: at most {config.max_count} "
+        "CRITICAL findings. Suggested action: run `modelguard scan` and remediate the "
+        "reported findings before re-registering or deploying."
+    )
+
+
+def _check_max_high_findings(ctx: PolicyEvaluationContext, config: RuleConfig) -> tuple[bool, str]:
+    if not ctx.scan_performed:
+        return False, (
+            "max_high_findings is enabled but no scan was performed. Expected: a scan "
+            "report to check finding counts against. Suggested action: ensure "
+            "ModelGuard.check_policy() (which always scans) is used, or otherwise pass "
+            "scan_performed=True with real finding counts to build_context()."
+        )
+    if ctx.high_finding_count <= config.max_count:
+        return True, (
+            f"{ctx.high_finding_count} HIGH finding(s) found, "
+            f"within the configured limit of {config.max_count}."
+        )
+    return False, (
+        f"{ctx.high_finding_count} HIGH finding(s) found, exceeding the configured "
+        f"limit of {config.max_count}. Expected: at most {config.max_count} HIGH "
+        "findings. Suggested action: run `modelguard scan` and remediate the reported "
+        "findings before re-registering or deploying."
+    )
+
+
+_RULE_CHECKS: dict[str, Callable[[PolicyEvaluationContext, RuleConfig], tuple[bool, str]]] = {
     "require_valid_signature": _check_require_valid_signature,
     "require_ml_bom": _check_require_ml_bom,
     "require_known_lineage": _check_require_known_lineage,
     "require_license": _check_require_license,
     "reject_revoked_models": _check_reject_revoked_models,
+    "max_critical_findings": _check_max_critical_findings,
+    "max_high_findings": _check_max_high_findings,
 }
 
 
@@ -144,8 +220,9 @@ def evaluate(context: PolicyEvaluationContext, policy: PolicyDocument) -> Policy
             )
             continue
 
-        passed, message = check(context)
-        action = config.on_fail if config else "deny"  # pragma: no branch -- config is set when enabled
+        assert config is not None  # enabled implies config was found above
+        passed, message = check(context, config)
+        action = config.on_fail
         results.append(RuleResult(rule=rule_name, enabled=True, passed=passed, action=action, message=message))
 
         if passed:
