@@ -136,3 +136,78 @@ def test_check_policy_denies_revoked_model_regardless_of_configured_rules(tmp_pa
     result = guard.check_policy(artifact, mbom_path, sig_path, policy_path)
 
     assert result.decision == Decision.REVOKED
+
+
+# -- Phase 4: scanning wired into check_policy() -----------------------
+
+
+def test_check_policy_denies_when_scan_finds_a_critical_secret(tmp_path: Path) -> None:
+    guard = ModelGuard()
+    artifact_dir = tmp_path / "model"
+    artifact_dir.mkdir()
+    (artifact_dir / "weights.bin").write_bytes(b"weights")
+    (artifact_dir / "leaked.txt").write_text("AKIAABCDEFGHIJKLMNOP")
+
+    manifest = guard.build_manifest(
+        artifact_dir, DeclaredMetadata(model_id="demo", version="1.0.0")
+    )
+    bom = guard.generate_mbom(manifest)
+    keypair = generate_keypair("dev@example.com")
+    envelope = guard.sign(manifest, bom, keypair)
+
+    mbom_path = tmp_path / "model.bom.json"
+    mbom_path.write_text(bom.to_json())
+    sig_path = tmp_path / "model.sig.json"
+    sig_path.write_text(envelope.to_json())
+
+    policy_path = _policy(
+        tmp_path,
+        """
+        policy:
+          name: strict
+        rules:
+          max_critical_findings: {enabled: true, on_fail: deny, max_count: 0}
+        """,
+    )
+
+    result = guard.check_policy(artifact_dir, mbom_path, sig_path, policy_path)
+
+    assert result.decision == Decision.DENY
+    assert any(r.rule == "max_critical_findings" for r in result.failed_rules)
+
+
+def test_check_policy_allows_same_policy_without_the_offending_file(tmp_path: Path) -> None:
+    """Same policy, same directory structure, but no .pkl/secret file --
+    the count-based rule must ALLOW rather than deny by default.
+    """
+    guard = ModelGuard()
+    artifact_dir = tmp_path / "model"
+    artifact_dir.mkdir()
+    (artifact_dir / "weights.safetensors").write_bytes(b"weights")
+
+    manifest = guard.build_manifest(
+        artifact_dir, DeclaredMetadata(model_id="demo", version="1.0.0")
+    )
+    bom = guard.generate_mbom(manifest)
+    keypair = generate_keypair("dev@example.com")
+    envelope = guard.sign(manifest, bom, keypair)
+
+    mbom_path = tmp_path / "model.bom.json"
+    mbom_path.write_text(bom.to_json())
+    sig_path = tmp_path / "model.sig.json"
+    sig_path.write_text(envelope.to_json())
+
+    policy_path = _policy(
+        tmp_path,
+        """
+        policy:
+          name: strict
+        rules:
+          max_critical_findings: {enabled: true, on_fail: deny, max_count: 0}
+          max_high_findings: {enabled: true, on_fail: deny, max_count: 0}
+        """,
+    )
+
+    result = guard.check_policy(artifact_dir, mbom_path, sig_path, policy_path)
+
+    assert result.decision == Decision.ALLOW
