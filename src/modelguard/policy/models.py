@@ -29,6 +29,7 @@ POLICY_SCHEMA_VERSION = "1"
 # a finding count to evaluate them against yet.
 RuleName = Literal[
     "require_valid_signature",
+    "require_trusted_signer",
     "require_ml_bom",
     "require_known_lineage",
     "require_license",
@@ -40,6 +41,7 @@ RuleName = Literal[
 KNOWN_RULE_NAMES: frozenset[str] = frozenset(
     {
         "require_valid_signature",
+        "require_trusted_signer",
         "require_ml_bom",
         "require_known_lineage",
         "require_license",
