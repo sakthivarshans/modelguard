@@ -59,15 +59,42 @@ not assume it works.
 - **(Phase 3)** CLI: `modelguard policy validate` / `modelguard policy check`,
   with distinct exit codes per decision (0 allowed, 2 deny,
   3 review required, 4 quarantine, 5 revoked, 1 error).
+- **(Phase 4)** A plugin-based **scanner architecture** (`modelguard.scanning`):
+  a `Scanner` `Protocol`, a shared symlink-safe file-walking helper, and
+  three built-in scanners --
+  `UnsafeSerializationScanner` (pickle-extension and pickle-protocol-header
+  detection; never unpickles anything), `SecretScanner` (a narrow,
+  high-confidence regex set: AWS access key IDs, PEM private key
+  headers, GitHub PATs, Slack tokens; size- and binary-file-skipping;
+  never echoes matched secret text into a finding), and
+  `MetadataCompletenessScanner` (informational-only: missing license,
+  missing lineage, missing model identity). `run_scanners()` isolates
+  each scanner so one raising scanner cannot crash the run or silently
+  count as "clean" -- see `ScanReport.clean`/`all_scanners_ok`.
+- **(Phase 4)** Two new policy rules that consume scan results:
+  `max_critical_findings` and `max_high_findings`. Both **fail closed**:
+  enabling either rule without a scan having actually run denies rather
+  than silently treating "no scan" as "zero findings". `RuleConfig`
+  gained a `max_count` field for these two rules.
+- **(Phase 4)** `ModelGuard.scan(...)` runs the default scanner set
+  against a local artifact. `ModelGuard.check_policy(...)` now always
+  runs a scan as part of every policy check, so `max_critical_findings`/
+  `max_high_findings` have real finding counts to evaluate without any
+  extra caller-side wiring.
+- **(Phase 4)** CLI: `modelguard scan PATH [--manifest ...] [--mbom ...]
+  [--fail-on info|low|medium|high|critical] [--format json]`. Exit code
+  0 if every scanner ran successfully and no finding at or above
+  `--fail-on` (default: `high`) exists; 2 otherwise; 1 on an
+  unexpected error.
 
 ## Explicitly NOT implemented yet
 
-- **Only five policy rules exist**, and all of them evaluate boolean
-  signals ModelGuard can already compute (signature validity, ML-BOM
-  presence, declared lineage presence, declared license presence,
-  revocation). The rules described in the product document that
-  depend on data ModelGuard does not yet produce -- `max_critical_vulnerabilities`,
-  `max_high_vulnerabilities` (needs scanners), `require_human_approval_for_high_risk`
+- **Seven policy rules exist**, and all of them evaluate signals
+  ModelGuard can already compute (signature validity, ML-BOM presence,
+  declared lineage presence, declared license presence, revocation,
+  and -- as of Phase 4 -- CRITICAL/HIGH scan finding counts). The rules
+  described in the product document that depend on data ModelGuard
+  still does not produce -- `require_human_approval_for_high_risk`
   (needs risk classification), trusted-publisher allow-lists, format
   allow/block-lists, and expiration -- are **not implemented and not
   accepted** by the policy schema. A policy file referencing them is
@@ -84,9 +111,10 @@ not assume it works.
   original manifest file. Call `modelguard.policy.evaluate()` directly
   with a full `PolicyEvaluationContext` if you need manifest-level
   license data considered.
-- **The policy engine does not yet integrate with scanners or the
-  registry beyond revocation** -- `reject_revoked_models` is the only
-  rule connected to Phase 2's registry.
+- **The policy engine does not yet integrate with the registry beyond
+  revocation** -- `reject_revoked_models` is the only rule connected to
+  Phase 2's registry. Scanning is now integrated (Phase 4), but risk
+  classification and license allow-lists are not.
 - **No PostgreSQL, S3, or FastAPI service.** Phase 2's registry and
   provenance store are local, file-backed implementations behind
   `Protocol` interfaces (`Registry`, and an implicit provenance-store
@@ -99,9 +127,16 @@ not assume it works.
   event log on every call. This is fine at the scale a local file
   naturally supports; it has not been tested or optimized for large
   event counts.
-- **No scanners.** No unsafe-serialization detection, no dependency
-  scanning, no secret scanning. A `.pkl` file is hashed and signed
-  exactly like any other file; ModelGuard does not yet warn about it.
+- **No scanners beyond the three built-in ones.** No dependency
+  scanning, no container scanning, no license-allowlist scanning, no
+  opcode-level pickle analysis (only extension and header-byte
+  detection -- see `src/modelguard/scanning/unsafe_serialization.py`),
+  no recursive archive inspection (a `.zip`/`.tar` inside an artifact
+  is scanned as an opaque binary blob, not unpacked and scanned
+  internally), and no suppression/triage workflow for findings beyond
+  the fixed `status="open"` field. The secret scanner is intentionally
+  narrow (four pattern families) rather than general-purpose -- see
+  `src/modelguard/scanning/secrets.py`.
 - **No Sigstore, KMS, HSM, or enterprise identity integration.** Only
   raw local Ed25519 keys, generated and stored unencrypted on disk.
 - **No format-specific parsing.** ModelGuard hashes bytes; it does not
@@ -137,3 +172,17 @@ not assume it works.
   a conservative, fail-closed choice, not a statement that symlink
   support is unimportant -- see the design note in
   `src/modelguard/hashing/digest.py`.
+- **(Phase 4)** Scanning treats symlinks differently from hashing on
+  purpose: hashing fails closed (raises) on any symlink, because it is
+  the security-critical identity computation; scanning is best-effort
+  and skips a symlink with a LOW-severity `scan_skipped` finding
+  instead, so one unsafe entry does not abort the rest of the scan.
+  Either way, a symlink is never followed -- only what happens on
+  encountering one differs. See `src/modelguard/scanning/_walk.py`.
+- **(Phase 4) Scan reports are not signed.** A `ScanReport` produced by
+  `modelguard scan` or `ModelGuard.scan()` is not itself cryptographically
+  bound to anything beyond the artifact digest it re-hashes locally;
+  it is not embedded in the signed manifest/ML-BOM/signature envelope,
+  and there is no tamper-evidence on a scan report the way there is on
+  the audit/provenance/registry logs. A scan report should be treated
+  as a local, unsigned observation, not an attestation.
