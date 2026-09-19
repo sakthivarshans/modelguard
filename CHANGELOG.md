@@ -4,6 +4,80 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.5.0] - Phase 5: CI/CD, caching, admission, trust roots
+
+### SECURITY FIX -- read this first
+
+- **`modelguard policy check` / `ModelGuard.check_policy()` returned
+  `ALLOW` (exit 0) for a tampered artifact in 0.3.0 and 0.4.0.** The
+  policy context received `signature_valid`, which is a check on the
+  signature *bytes* and stays `True` when the artifact is modified;
+  nothing passed it whether the artifact digest still matched. Only
+  `modelguard verify` caught tampering. A Phase 3 test asserted the
+  wrong behavior (`ALLOW`) with a comment noting the gap. Fixed:
+  a digest mismatch is now an **unconditional DENY** (`artifact_integrity`,
+  not a configurable rule, cannot be weakened by any policy). If you
+  gated CI or deployments on `policy check` with 0.3.0/0.4.0, treat
+  those gates as not having detected post-signing modification.
+
+### Added
+
+- **Trust roots.** `ModelGuard(trusted_key_fingerprints=[...])`,
+  `--trusted-fingerprint` (repeatable) on `verify`/`policy check`, new
+  `modelguard fingerprint KEYFILE` command (`keygen` also prints the
+  fingerprint), and `modelguard.signing.trust`. A fingerprint is the
+  SHA-256 of the raw Ed25519 public key. When configured, a valid
+  signature from any other key is denied. Empty or malformed
+  fingerprints raise `TrustConfigurationError` rather than silently
+  never matching.
+- New policy rule `require_trusted_signer` (eight rules now). Fails
+  closed if no trust roots were configured.
+- `VerificationResult` gained `digest_matches`, `signer_trusted`
+  (`None` = not checked), `revocation_checked`, `digest_from_cache`.
+  Fail-closed defaults.
+- **Digest cache** (`modelguard.cache.CachedHasher`, opt-in via
+  `ModelGuard(cache_dir=...)` / `--cache-dir`). Caches only the digest
+  computation, keyed on file metadata (size, mtime, ctime, inode,
+  device) with git-style racy-timestamp handling. Signature, ML-BOM,
+  trust, revocation, and policy are always recomputed, so a warm cache
+  cannot override a new revocation. See `docs/limitations.md` for the
+  trust assumptions.
+- **Admission hook** `modelguard.admission.admit()` -> `AdmissionDecision`
+  (+ `AdmissionDenied`). Fails closed on missing trust roots, any
+  exception, or an audit-write failure; independently requires an
+  untampered artifact and trusted signer regardless of policy. Optional
+  hash-chained audit record (`deployment.admission` event).
+- `ModelGuard.check_policy_detailed()` returning `PolicyCheck`
+  (decision + verification + scan report).
+- `hashing.artifact_digest_from_files()`: the single home of the
+  artifact-digest rules (`hash_directory` now uses it).
+- Examples: `examples/ci/github-actions-verify-model.yml`,
+  `examples/docker/{Dockerfile,entrypoint.sh}`,
+  `examples/admission/deploy_gate.py`. `examples/policies/production.yaml`
+  now enables `require_trusted_signer`.
+
+### Changed
+
+- **Breaking (pre-1.0):** `policy.build_context()` now requires the
+  keyword `artifact_digest_matches`.
+- `check_policy()` no longer hashes the artifact twice (`run_scanners`
+  accepts an `artifact_digest` computed by the caller in the same
+  operation). Roughly halves uncached `check_policy` time on large
+  models.
+- `verify` text output now says `Signer : NOT CHECKED` and
+  `Revocation : NOT CHECKED` instead of implying those checks passed.
+
+### Deliberately not done
+
+- No `org.modelguard.verification.status` image label (the product
+  document lists one): an image label is an unauthenticated claim, so a
+  build-time "verified" label would be exactly the fake assurance the
+  project rules forbid. The Docker example uses the id/digest labels
+  (informational) and a startup verification (the control).
+- Scan results are not cached: they depend on the ML-BOM and scanner
+  set, and the measured cost was the redundant hash, now removed.
+- No Kubernetes admission webhook; `admit()` is the building block.
+
 ## [0.4.0] - Phase 4: Scanning
 
 ### Added
