@@ -41,6 +41,7 @@ from modelguard.provenance.models import ProvenanceEvent, RelationshipType
 from modelguard.provenance.store import LocalProvenanceStore
 from modelguard.registry.local import LocalRegistry
 from modelguard.registry.models import RegistryRecord, RevocationRecord
+from modelguard.scanning import ScanReport, Severity, run_scanners
 from modelguard.signing.envelope import SignatureEnvelope
 from modelguard.signing.keys import LocalKeyPair, load_public_key
 from modelguard.signing.signer import sign_artifact
@@ -205,6 +206,23 @@ class ModelGuard:
     def load_public_key(self, path: str | Path) -> Ed25519PublicKey:
         return load_public_key(Path(path))
 
+    # -- scanning ----------------------------------------------------
+
+    def scan(
+        self,
+        artifact_path: str | Path,
+        manifest: Manifest | None = None,
+        mbom: MLBOM | None = None,
+    ) -> ScanReport:
+        """Run the default scanner set against a local artifact.
+
+        Passing ``manifest``/``mbom`` when available lets the metadata-
+        completeness scanner check declared fields; omit them to scan
+        artifact bytes only (unsafe-serialization and secret findings
+        are unaffected either way).
+        """
+        return run_scanners(Path(artifact_path), manifest, mbom)
+
     # -- registry ----------------------------------------------------
 
     def register(
@@ -300,11 +318,17 @@ class ModelGuard:
         signature_path: str | Path,
         policy_path: str | Path,
     ) -> PolicyDecisionResult:
-        """Run verification, then evaluate a policy against the result.
+        """Run verification and a scan, then evaluate a policy against
+        the combined result.
 
         This is the single call CI/CD should use: it combines
-        ``verify()`` (signature, digest, ML-BOM, revocation) with
-        policy-as-code evaluation and returns one explainable decision.
+        ``verify()`` (signature, digest, ML-BOM, revocation) with a
+        scan (so ``max_critical_findings``/``max_high_findings`` rules
+        have real finding counts to evaluate) and policy-as-code
+        evaluation, returning one explainable decision. A policy that
+        does not enable either count-based rule pays the cost of a
+        scan but is otherwise unaffected -- scanning always runs here
+        so that enabling those rules later requires no code changes.
         """
         path = Path(artifact_path)
         mbom = MLBOM.model_validate(json.loads(Path(mbom_path).read_text()))
@@ -322,6 +346,8 @@ class ModelGuard:
             version=envelope.payload.version,
         )
 
+        scan_report = self.scan(path, manifest, mbom)
+
         policy = load_policy_file(Path(policy_path))
         context = build_context(
             manifest,
@@ -329,5 +355,8 @@ class ModelGuard:
             signature_valid=verification.signature_valid,
             mbom_valid=verification.mbom_valid,
             revoked=verification.revoked,
+            scan_performed=True,
+            critical_finding_count=scan_report.count(Severity.CRITICAL),
+            high_finding_count=scan_report.count(Severity.HIGH),
         )
         return evaluate(context, policy)
