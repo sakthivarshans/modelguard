@@ -3,7 +3,11 @@
 # Load and check with:
 #   modelguard policy validate examples/policies/production.yaml
 #   modelguard policy check ./model --mbom model.bom.json \
-#     --signature model.sig.json --policy examples/policies/production.yaml
+#     --signature model.sig.json --policy examples/policies/production.yaml \
+#     --trusted-fingerprint "$(modelguard fingerprint publisher.modelguard.pub)"
+#
+# Note: a digest mismatch (tampered artifact) is ALWAYS a DENY, whatever
+# this file says -- integrity is not a configurable rule.
 
 version: "1"
 
@@ -13,6 +17,15 @@ policy:
 
 rules:
   require_valid_signature:
+    enabled: true
+    on_fail: deny
+
+  # Phase 5: a valid signature from an unknown key proves nothing about
+  # who signed (anyone can sign with a key they just generated). This
+  # rule requires the signer to be in the trusted fingerprint set given
+  # via --trusted-fingerprint / trusted_key_fingerprints=, and fails
+  # closed (DENY) if no trusted fingerprints were supplied at all.
+  require_trusted_signer:
     enabled: true
     on_fail: deny
 
