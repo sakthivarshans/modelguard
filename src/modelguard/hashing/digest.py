@@ -104,6 +104,41 @@ def _canonical_manifest_bytes(files: list[FileDigest]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def artifact_digest_from_files(
+    artifact_type: str, files: list[FileDigest] | tuple[FileDigest, ...]
+) -> ArtifactDigest:
+    """Derive an ``ArtifactDigest`` from already-computed per-file digests.
+
+    This is the single place the artifact-level digest rules live, so
+    ``hash_directory`` and anything that needs to *re-derive* a digest
+    from stored per-file digests (e.g. the verification cache's
+    consistency check) cannot drift apart.
+
+    * ``"file"``: exactly one file; the artifact digest is that file's
+      SHA-256.
+    * ``"directory"``: the SHA-256 of the canonical manifest of all
+      files (see ``_canonical_manifest_bytes``).
+    """
+    if artifact_type == "file":
+        if len(files) != 1:
+            raise ValueError("a file artifact has exactly one file digest")
+        return ArtifactDigest(
+            algorithm=_DIGEST_ALGORITHM,
+            artifact_type="file",
+            digest=files[0].sha256,
+            files=tuple(files),
+        )
+    if artifact_type != "directory":
+        raise ValueError(f"unknown artifact_type: {artifact_type!r}")
+    manifest_bytes = _canonical_manifest_bytes(list(files))
+    return ArtifactDigest(
+        algorithm=_DIGEST_ALGORITHM,
+        artifact_type="directory",
+        digest=hashlib.sha256(manifest_bytes).hexdigest(),
+        files=tuple(sorted(files, key=lambda f: f.path)),
+    )
+
+
 def hash_file(path: Path) -> ArtifactDigest:
     """Hash a single file artifact."""
     if not path.is_file():
@@ -113,12 +148,7 @@ def hash_file(path: Path) -> ArtifactDigest:
 
     digest, size = _hash_file_bytes(path)
     file_digest = FileDigest(path=path.name, sha256=digest, size=size)
-    return ArtifactDigest(
-        algorithm=_DIGEST_ALGORITHM,
-        artifact_type="file",
-        digest=digest,
-        files=(file_digest,),
-    )
+    return artifact_digest_from_files("file", [file_digest])
 
 
 def hash_directory(root: Path) -> ArtifactDigest:
@@ -166,15 +196,7 @@ def hash_directory(root: Path) -> ArtifactDigest:
     if not file_digests:
         raise EmptyArtifactError(str(root))
 
-    manifest_bytes = _canonical_manifest_bytes(file_digests)
-    directory_digest = hashlib.sha256(manifest_bytes).hexdigest()
-
-    return ArtifactDigest(
-        algorithm=_DIGEST_ALGORITHM,
-        artifact_type="directory",
-        digest=directory_digest,
-        files=tuple(sorted(file_digests, key=lambda f: f.path)),
-    )
+    return artifact_digest_from_files("directory", file_digests)
 
 
 def hash_artifact(path: Path) -> ArtifactDigest:
