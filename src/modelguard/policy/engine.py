@@ -53,6 +53,22 @@ class PolicyEvaluationContext:
     scan_performed: bool = False
     critical_finding_count: int = 0
     high_finding_count: int = 0
+    # Phase 5: whether the artifact on disk matched the digest bound in
+    # the signature, and whether the signing key is in the caller's
+    # explicit trust roots.
+    #
+    # ``artifact_digest_matches`` is an UNCONDITIONAL integrity gate,
+    # not a rule: ``False`` always yields DENY, whatever the policy
+    # says (see ``evaluate``). ``None`` means "not evaluated" and skips
+    # the gate -- it exists only so hand-built contexts written before
+    # Phase 5 keep working; ``build_context`` (the trusted path)
+    # requires the value explicitly.
+    #
+    # ``signer_trusted`` is ``None`` when no trust roots were
+    # configured at all; ``require_trusted_signer`` fails closed on
+    # ``None`` rather than treating "nothing configured" as "trusted".
+    artifact_digest_matches: bool | None = None
+    signer_trusted: bool | None = None
 
 
 def build_context(
@@ -62,9 +78,11 @@ def build_context(
     signature_valid: bool,
     mbom_valid: bool,
     revoked: bool,
+    artifact_digest_matches: bool,
     scan_performed: bool = False,
     critical_finding_count: int = 0,
     high_finding_count: int = 0,
+    signer_trusted: bool | None = None,
 ) -> PolicyEvaluationContext:
     """Build a context from a manifest, ML-BOM, and the boolean/count
     results already computed by ``ModelGuard.verify()`` and
@@ -83,6 +101,8 @@ def build_context(
         scan_performed=scan_performed,
         critical_finding_count=critical_finding_count,
         high_finding_count=high_finding_count,
+        artifact_digest_matches=artifact_digest_matches,
+        signer_trusted=signer_trusted,
     )
 
 
@@ -95,6 +115,30 @@ def _check_require_valid_signature(
         "No valid signature was found. Expected: a signature verifiable against a "
         "known public key. Suggested action: sign the artifact with `modelguard sign` "
         "before registering or deploying it."
+    )
+
+
+def _check_require_trusted_signer(
+    ctx: PolicyEvaluationContext, config: RuleConfig
+) -> tuple[bool, str]:
+    # Fail closed on "not configured": a valid signature from an
+    # unknown key proves nothing about who signed -- anyone can sign
+    # with a key they just generated. Enabling this rule without
+    # supplying trust roots must not quietly pass.
+    if ctx.signer_trusted is None:
+        return False, (
+            "require_trusted_signer is enabled but no trusted signer keys were configured. "
+            "Expected: at least one trusted key fingerprint. Suggested action: pass "
+            "--trusted-fingerprint (CLI) or trusted_key_fingerprints=[...] (SDK); compute a "
+            "fingerprint with `modelguard fingerprint <public-key-file>`."
+        )
+    if ctx.signer_trusted:
+        return True, "The artifact was signed by a trusted key."
+    return False, (
+        "The signing key is not in the configured trusted set. Expected: a signature "
+        "made by one of the trusted key fingerprints. Suggested action: verify the "
+        "signer out-of-band, then add its fingerprint to the trusted set, or obtain the "
+        "artifact from a trusted publisher."
     )
 
 
@@ -189,6 +233,7 @@ def _check_max_high_findings(ctx: PolicyEvaluationContext, config: RuleConfig) -
 
 _RULE_CHECKS: dict[str, Callable[[PolicyEvaluationContext, RuleConfig], tuple[bool, str]]] = {
     "require_valid_signature": _check_require_valid_signature,
+    "require_trusted_signer": _check_require_trusted_signer,
     "require_ml_bom": _check_require_ml_bom,
     "require_known_lineage": _check_require_known_lineage,
     "require_license": _check_require_license,
@@ -209,6 +254,31 @@ def evaluate(context: PolicyEvaluationContext, policy: PolicyDocument) -> Policy
     """
     results: list[RuleResult] = []
     decision = Decision.ALLOW
+
+    # Unconditional integrity gate. A cryptographically valid signature
+    # says nothing about the artifact in front of us unless its digest
+    # matches what was signed; before this gate existed, a tampered
+    # artifact passed every policy that did not happen to check it
+    # (see CHANGELOG 0.5.0). This is deliberately NOT a configurable
+    # rule: no policy should be able to opt into deploying bytes that
+    # differ from what was signed.
+    if context.artifact_digest_matches is False:
+        results.append(
+            RuleResult(
+                rule="artifact_integrity",
+                enabled=True,
+                passed=False,
+                action="deny",
+                message=(
+                    "The artifact on disk does not match the digest bound in the signature: "
+                    "it may have been modified after signing, or the wrong signature/ML-BOM "
+                    "was supplied. This check is unconditional and cannot be disabled by "
+                    "policy. Suggested action: re-obtain the artifact from a trusted source, "
+                    "or re-sign it if the change was intentional."
+                ),
+            )
+        )
+        decision = Decision.DENY
 
     for rule_name, check in _RULE_CHECKS.items():
         config = policy.rules.get(rule_name)
