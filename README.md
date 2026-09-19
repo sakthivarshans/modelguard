@@ -16,6 +16,14 @@ verified artifact against it, get a deterministic, explainable
 decision (`ALLOW` / `ALLOW_WITH_WARNINGS` / `REVIEW_REQUIRED` /
 `QUARANTINE` / `DENY` / `REVOKED`).
 
+**Phase 4 (scanning):** a plugin-based scanner architecture
+(`modelguard.scanning`) with three built-in scanners --
+unsafe-serialization detection, a narrow high-confidence secret
+scanner, and metadata-completeness checks -- wired into the policy
+engine via two new count-based rules (`max_critical_findings`,
+`max_high_findings`). `modelguard.check_policy()` now always scans as
+part of every policy check.
+
 See `docs/limitations.md` for what is explicitly out of scope so far.
 
 ## Quick start
@@ -34,6 +42,14 @@ modelguard sign ./examples/basic_verification/model \
   -o model.sig.json
 modelguard verify ./examples/basic_verification/model \
   --mbom model.bom.json --signature model.sig.json
+```
+
+Scan it for unsafe serialization, exposed secrets, and incomplete metadata:
+
+```bash
+modelguard scan ./examples/basic_verification/model \
+  --manifest model.manifest.json --mbom model.bom.json
+echo "exit: $?"   # 0 -- clean, or 2 if a finding at/above --fail-on (default: high) exists
 ```
 
 Register it, then check it against a policy:
@@ -71,7 +87,22 @@ result = guard.verify("./model", "model.bom.json", "model.sig.json")
 result.raise_if_denied()
 ```
 
-With a local registry configured, check a verified artifact against a policy:
+Scan an artifact directly:
+
+```python
+from modelguard import ModelGuard
+
+guard = ModelGuard()
+report = guard.scan("./model")
+
+if not report.clean:
+    for finding in report.findings:
+        print(f"[{finding.severity.value}] {finding.scanner}: {finding.message}")
+```
+
+With a local registry configured, check a verified artifact against a policy
+(this always runs a scan too, so `max_critical_findings`/`max_high_findings`
+rules have real finding counts to evaluate):
 
 ```python
 from modelguard import ModelGuard
