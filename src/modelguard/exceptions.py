@@ -136,3 +136,29 @@ class VerificationDenied(ModelGuardError):
         self.reasons = reasons
         joined = "; ".join(reasons) if reasons else "no reason provided"
         super().__init__(f"Verification denied: {joined}")
+
+
+# --------------------------------------------------------------------------
+# Trust configuration and deployment admission errors (Phase 5)
+# --------------------------------------------------------------------------
+
+
+class TrustConfigurationError(ModelGuardError):
+    """The trust-root configuration is invalid (malformed or empty).
+
+    Raised eagerly at configuration time. A malformed fingerprint that
+    was silently accepted would simply never match anything, and an
+    empty trust set would be indistinguishable from "trust roots not
+    configured" -- both are configuration mistakes that must be loud.
+    """
+
+
+class AdmissionDenied(ModelGuardError):
+    """Raised by ``AdmissionDecision.raise_if_blocked()`` when a
+    deployment admission check did not admit the artifact.
+    """
+
+    def __init__(self, reasons: list[str]) -> None:
+        self.reasons = reasons
+        joined = "; ".join(reasons) if reasons else "no reason provided"
+        super().__init__(f"Deployment admission denied: {joined}")
