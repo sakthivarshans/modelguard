@@ -10,6 +10,7 @@ the framework's central guarantee.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from modelguard.exceptions import DigestMismatchError, SignatureInvalidError
-from modelguard.hashing.digest import hash_artifact
+from modelguard.hashing.digest import ArtifactDigest, hash_artifact
 from modelguard.mbom.models import MLBOM
 from modelguard.signing.envelope import SignatureEnvelope
 
@@ -55,9 +56,19 @@ def check_signature_bytes(envelope: SignatureEnvelope) -> None:
         raise SignatureInvalidError(f"Malformed signature or key data: {exc}") from exc
 
 
-def check_artifact_digest(artifact_path: Path, envelope: SignatureEnvelope) -> TamperCheckResult:
-    """Re-hash the artifact on disk and compare it to the signed digest."""
-    current = hash_artifact(artifact_path)
+def check_artifact_digest(
+    artifact_path: Path,
+    envelope: SignatureEnvelope,
+    hasher: Callable[[Path], ArtifactDigest] = hash_artifact,
+) -> TamperCheckResult:
+    """Hash the artifact on disk and compare it to the signed digest.
+
+    ``hasher`` exists so a caller can substitute a caching hasher (see
+    ``modelguard.cache``). Only the *digest computation* is pluggable;
+    the comparison against the signed digest below is not, and always
+    runs.
+    """
+    current = hasher(artifact_path)
     current_ref = f"{current.algorithm}:{current.digest}"
     return TamperCheckResult(
         current_digest=current_ref,
