@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar
 
 import click
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from modelguard.exceptions import ModelGuardError
 from modelguard.hashing.digest import hash_artifact
@@ -25,8 +28,14 @@ from modelguard.policy.loader import PolicyValidationError, load_policy_file
 from modelguard.policy.models import Decision
 from modelguard.scanning import Finding, ScanReport, Severity, run_scanners
 from modelguard.sdk import ModelGuard
-from modelguard.signing.keys import generate_keypair, load_private_key, save_keypair
+from modelguard.signing.keys import (
+    generate_keypair,
+    load_private_key,
+    load_public_key,
+    save_keypair,
+)
 from modelguard.signing.signer import sign_artifact
+from modelguard.signing.trust import public_key_fingerprint
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -61,6 +70,28 @@ _SEVERITY_DISPLAY_ORDER: tuple[Severity, ...] = (
 )
 
 _DEFAULT_STORAGE_ROOT = Path(".modelguard")
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _trust_and_cache_options(func: _F) -> _F:
+    """Options shared by ``verify`` and ``policy check``."""
+    func = click.option(
+        "--cache-dir",
+        type=click.Path(path_type=Path),
+        default=None,
+        help="Opt in to the local digest cache in this directory. Keep it somewhere the "
+        "artifact's supplier cannot write; see docs/limitations.md.",
+    )(func)
+    func = click.option(
+        "--trusted-fingerprint",
+        "trusted_fingerprints",
+        multiple=True,
+        help="SHA-256 fingerprint of a trusted signer public key (repeatable). Compute one "
+        "with `modelguard fingerprint KEYFILE`. Without any, the signer is NOT checked.",
+    )(func)
+    return func
 
 
 @click.group()
@@ -171,6 +202,25 @@ def keygen(identity: str, output_dir: Path) -> None:
     private_path, public_path = save_keypair(keypair, output_dir)
     click.echo(f"Private key: {private_path} (mode 0600, keep this secret)")
     click.echo(f"Public key : {public_path}")
+    fingerprint = public_key_fingerprint(
+        keypair.public_key.public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    )
+    click.echo(f"Fingerprint: {fingerprint}")
+
+
+@cli.command()
+@click.argument("public_key_path", type=click.Path(exists=True, path_type=Path))
+def fingerprint(public_key_path: Path) -> None:
+    """Print the trust fingerprint (SHA-256 of the raw key) of a public key file.
+
+    This is the value to pass as --trusted-fingerprint. Obtain it from
+    the key's owner over a channel an attacker cannot tamper with.
+    """
+    try:
+        key = load_public_key(public_key_path)
+    except ModelGuardError as exc:
+        _fail(exc, "text")
+    click.echo(public_key_fingerprint(key.public_bytes(Encoding.Raw, PublicFormat.Raw).hex()))
 
 
 @cli.command()
@@ -222,29 +272,45 @@ def sign(
     default=None,
     help="Local registry root, to also check revocation status. Omit to skip that check.",
 )
+@_trust_and_cache_options
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
 def verify(
     path: Path,
     mbom_path: Path,
     signature_path: Path,
     storage_root: Path | None,
+    trusted_fingerprints: tuple[str, ...],
+    cache_dir: Path | None,
     output_format: str,
 ) -> None:
     """Verify an artifact against its ML-BOM and detached signature.
 
     Exit code 0 if allowed, 2 if the verification was denied, 1 on an
-    unexpected error (missing file, malformed input).
+    unexpected error (missing file, malformed input, bad configuration).
+    Without --trusted-fingerprint the signer is not checked: a valid
+    signature then only proves *some* key signed the artifact.
     """
-    guard = ModelGuard(storage_root=storage_root)
+    try:
+        guard = ModelGuard(
+            storage_root=storage_root,
+            cache_dir=cache_dir,
+            trusted_key_fingerprints=trusted_fingerprints or None,
+        )
+    except ModelGuardError as exc:
+        _fail(exc, output_format)
     result = guard.verify(path, mbom_path, signature_path)
 
     if output_format == "json":
         payload = {
             "allowed": result.allowed,
             "artifact_digest": result.artifact_digest,
+            "digest_matches": result.digest_matches,
             "signature_valid": result.signature_valid,
+            "signer_trusted": result.signer_trusted,
             "mbom_valid": result.mbom_valid,
             "revoked": result.revoked,
+            "revocation_checked": result.revocation_checked,
+            "digest_from_cache": result.digest_from_cache,
             "reasons": list(result.reasons),
         }
         click.echo(json.dumps(payload, indent=2))
@@ -253,9 +319,17 @@ def verify(
         click.echo(f"Verification: {status}")
         click.echo(f"Digest       : {result.artifact_digest}")
         click.echo(f"Signature    : {'valid' if result.signature_valid else 'INVALID'}")
+        if result.signer_trusted is None:
+            click.echo("Signer       : NOT CHECKED (no --trusted-fingerprint given)")
+        else:
+            click.echo(f"Signer       : {'trusted' if result.signer_trusted else 'NOT TRUSTED'}")
         click.echo(f"ML-BOM       : {'matches' if result.mbom_valid else 'DOES NOT MATCH'}")
         if result.revoked:
             click.echo("Revoked      : YES")
+        elif not result.revocation_checked:
+            click.echo("Revocation   : NOT CHECKED (no --storage-root / model identity)")
+        if result.digest_from_cache:
+            click.echo("Digest source: local cache (file metadata unchanged)")
         for reason in result.reasons:
             click.echo(f"  reason: {reason}")
 
@@ -530,6 +604,7 @@ def policy_validate(policy_path: Path) -> None:
     default=None,
     help="Local registry root, to also check revocation status.",
 )
+@_trust_and_cache_options
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
 def policy_check(
     path: Path,
@@ -537,6 +612,8 @@ def policy_check(
     signature_path: Path,
     policy_file: Path,
     storage_root: Path | None,
+    trusted_fingerprints: tuple[str, ...],
+    cache_dir: Path | None,
     output_format: str,
 ) -> None:
     """Verify PATH and evaluate it against a policy document.
@@ -544,8 +621,12 @@ def policy_check(
     Exit codes: 0 = ALLOW/ALLOW_WITH_WARNINGS, 2 = DENY,
     3 = REVIEW_REQUIRED, 4 = QUARANTINE, 5 = REVOKED, 1 = error.
     """
-    guard = ModelGuard(storage_root=storage_root)
     try:
+        guard = ModelGuard(
+            storage_root=storage_root,
+            cache_dir=cache_dir,
+            trusted_key_fingerprints=trusted_fingerprints or None,
+        )
         result = guard.check_policy(path, mbom_path, signature_path, policy_file)
     except ModelGuardError as exc:
         _fail(exc, output_format)
