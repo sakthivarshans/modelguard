@@ -35,19 +35,31 @@ def run_scanners(
     manifest: Manifest | None = None,
     mbom: MLBOM | None = None,
     scanners: tuple[Scanner, ...] | None = None,
+    artifact_digest: str | None = None,
 ) -> ScanReport:
     """Run every scanner in ``scanners`` (default: ``DEFAULT_SCANNERS``)
     against ``artifact_path`` and aggregate the results into one
     ``ScanReport``.
 
-    Re-hashes the artifact to bind the report to a specific digest
-    (rather than trusting a caller-supplied digest) so a stale report
-    can never be silently attributed to a different artifact.
+    By default the artifact is hashed here to bind the report to a
+    specific digest, so a stale report can never be silently
+    attributed to a different artifact.
+
+    ``artifact_digest`` lets a caller that has *just computed that
+    digest itself in the same operation* (``ModelGuard.check_policy``
+    does, via ``verify()``) skip a second full read of the artifact.
+    Only pass a digest your own code computed moments ago -- never one
+    read from an untrusted file, since the report would then be bound
+    to whatever the attacker wrote. Note that the scanners still read
+    the files afterwards, so a file swapped between your hash and the
+    scan is not detected here; that check-to-use window is documented
+    in ``docs/security/threat-model.md``.
     """
     active = scanners if scanners is not None else DEFAULT_SCANNERS
 
-    digest = hash_artifact(artifact_path)
-    artifact_digest = f"{digest.algorithm}:{digest.digest}"
+    if artifact_digest is None:
+        digest = hash_artifact(artifact_path)
+        artifact_digest = f"{digest.algorithm}:{digest.digest}"
 
     statuses: dict[str, str] = {}
     errors: dict[str, str] = {}
