@@ -157,3 +157,105 @@ def test_explain_for_fully_passing_evaluation_is_reassuring_not_alarming() -> No
 
     assert "ALLOW" in explanation
     assert "Failed rule" not in explanation
+
+
+# -- Phase 4: count-based rules (max_critical_findings, max_high_findings) --
+
+
+def _scan_context(**overrides: object) -> PolicyEvaluationContext:
+    defaults: dict[str, object] = {
+        "subject": "demo@1.0.0",
+        "signature_valid": True,
+        "mbom_valid": True,
+        "revoked": False,
+        "has_license": True,
+        "has_declared_lineage": True,
+        "scan_performed": True,
+        "critical_finding_count": 0,
+        "high_finding_count": 0,
+    }
+    defaults.update(overrides)
+    return PolicyEvaluationContext(**defaults)  # type: ignore[arg-type]
+
+
+def test_max_critical_findings_enabled_but_no_scan_fails_closed() -> None:
+    """Enabling this rule without ever running a scan must DENY, not
+    silently treat "no scan" as "zero findings found".
+    """
+    policy = PolicyDocument(
+        name="p",
+        rules={"max_critical_findings": RuleConfig(enabled=True, on_fail="deny", max_count=0)},
+    )
+    result = evaluate(_scan_context(scan_performed=False), policy)
+
+    assert result.decision == Decision.DENY
+    assert any(r.rule == "max_critical_findings" for r in result.failed_rules)
+
+
+def test_max_critical_findings_passes_when_scan_performed_and_within_limit() -> None:
+    policy = PolicyDocument(
+        name="p",
+        rules={"max_critical_findings": RuleConfig(enabled=True, on_fail="deny", max_count=0)},
+    )
+    result = evaluate(_scan_context(scan_performed=True, critical_finding_count=0), policy)
+
+    assert result.decision == Decision.ALLOW
+
+
+def test_max_critical_findings_fails_when_count_exceeds_limit() -> None:
+    policy = PolicyDocument(
+        name="p",
+        rules={"max_critical_findings": RuleConfig(enabled=True, on_fail="deny", max_count=0)},
+    )
+    result = evaluate(_scan_context(scan_performed=True, critical_finding_count=1), policy)
+
+    assert result.decision == Decision.DENY
+    assert any(r.rule == "max_critical_findings" for r in result.failed_rules)
+
+
+def test_max_critical_findings_respects_a_nonzero_configured_limit() -> None:
+    policy = PolicyDocument(
+        name="p",
+        rules={"max_critical_findings": RuleConfig(enabled=True, on_fail="deny", max_count=2)},
+    )
+    within_limit = evaluate(_scan_context(scan_performed=True, critical_finding_count=2), policy)
+    over_limit = evaluate(_scan_context(scan_performed=True, critical_finding_count=3), policy)
+
+    assert within_limit.decision == Decision.ALLOW
+    assert over_limit.decision == Decision.DENY
+
+
+def test_max_high_findings_enabled_but_no_scan_fails_closed() -> None:
+    policy = PolicyDocument(
+        name="p",
+        rules={"max_high_findings": RuleConfig(enabled=True, on_fail="deny", max_count=0)},
+    )
+    result = evaluate(_scan_context(scan_performed=False), policy)
+
+    assert result.decision == Decision.DENY
+    assert any(r.rule == "max_high_findings" for r in result.failed_rules)
+
+
+def test_max_high_findings_passes_within_limit_and_fails_over_limit() -> None:
+    policy = PolicyDocument(
+        name="p",
+        rules={"max_high_findings": RuleConfig(enabled=True, on_fail="deny", max_count=1)},
+    )
+    within_limit = evaluate(_scan_context(scan_performed=True, high_finding_count=1), policy)
+    over_limit = evaluate(_scan_context(scan_performed=True, high_finding_count=2), policy)
+
+    assert within_limit.decision == Decision.ALLOW
+    assert over_limit.decision == Decision.DENY
+
+
+def test_count_based_rule_disabled_by_default_does_not_require_a_scan() -> None:
+    """A policy that never enables the count-based rules must not be
+    affected by scan_performed=False -- the fail-closed behavior only
+    applies once the rule is actually enabled.
+    """
+    policy = PolicyDocument(
+        name="p", rules={"require_valid_signature": RuleConfig(enabled=True, on_fail="deny")}
+    )
+    result = evaluate(_scan_context(scan_performed=False), policy)
+
+    assert result.decision == Decision.ALLOW
