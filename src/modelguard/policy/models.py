@@ -20,17 +20,21 @@ from pydantic import BaseModel, ConfigDict, Field
 
 POLICY_SCHEMA_VERSION = "1"
 
-# Every rule Phase 3 knows how to evaluate. Deliberately smaller than
-# the full rule set in the product document: rules that depend on data
-# ModelGuard does not yet produce (scanner findings, risk
-# classification, license allow-lists) are left out rather than
-# accepted and silently ignored -- see docs/limitations.md.
+# Every rule ModelGuard knows how to evaluate. Deliberately smaller
+# than the full rule set in the product document: rules that depend on
+# data ModelGuard does not yet produce (risk classification, license
+# allow-lists) are left out rather than accepted and silently ignored
+# -- see docs/limitations.md. Phase 4 adds the two count-based rules;
+# they were withheld in Phase 3 specifically because nothing produced
+# a finding count to evaluate them against yet.
 RuleName = Literal[
     "require_valid_signature",
     "require_ml_bom",
     "require_known_lineage",
     "require_license",
     "reject_revoked_models",
+    "max_critical_findings",
+    "max_high_findings",
 ]
 
 KNOWN_RULE_NAMES: frozenset[str] = frozenset(
@@ -40,6 +44,8 @@ KNOWN_RULE_NAMES: frozenset[str] = frozenset(
         "require_known_lineage",
         "require_license",
         "reject_revoked_models",
+        "max_critical_findings",
+        "max_high_findings",
     }
 )
 
@@ -103,6 +109,12 @@ class RuleConfig(BaseModel):
 
     enabled: bool = True
     on_fail: RuleAction = "deny"
+    # Only meaningful for the count-based rules (max_critical_findings,
+    # max_high_findings); ignored by the boolean rules. Kept on the
+    # shared RuleConfig, rather than a rule-specific subclass, so the
+    # YAML schema and PolicyDocument.rules stay a single uniform
+    # mapping -- see policy/loader.py.
+    max_count: int = Field(default=0, ge=0)
 
 
 class PolicyDocument(BaseModel):
