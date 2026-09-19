@@ -103,4 +103,34 @@ and either found them or didn't. It proves nothing about:
   distinction between integrity/authenticity/provenance/policy
   compliance and behavioral safety).
 
+## Addendum -- Phase 5 (CI/CD, caching, admission, trust roots)
+
+Phase 5 adds trust roots, an integrity gate, a digest cache, an
+admission hook, and CI/Docker examples. It also corrects a defect in
+earlier addenda: the Phase 3 table said policy evaluation had "no
+residual risk" for the tested cases, but no test covered a *tampered
+artifact passing through `check_policy`*, and one test encoded the
+wrong result. Everything above still applies unless noted here.
+
+| Threat | Mitigation in this release | Residual risk |
+| --- | --- | --- |
+| **(Defect in 0.3.0/0.4.0)** Tampered artifact receives `ALLOW` from `policy check` because policy only saw `signature_valid` | Unconditional `artifact_integrity` DENY on digest mismatch, outside the rule set so no policy can weaken it. Tests: `test_check_policy_reflects_tampered_artifact_as_denial`, `test_tampered_artifact_is_denied_even_by_an_empty_policy`, CLI regression `test_policy_check_denies_a_tampered_artifact_regression`. | Direct `evaluate()` callers that hand-build a context with `artifact_digest_matches=None` skip the gate (compat). Anyone who relied on 0.3.0/0.4.0 `policy check` for tamper detection had no such protection. |
+| Attacker re-signs a tampered model with their own key ("signature confusion", previously listed as unmitigated) | Trusted key fingerprints checked against the key that verified the signature; `require_trusted_signer`; `admit()` requires a trusted signer regardless of policy. Test: `test_attacker_resigning_with_own_key_is_denied`. | **Opt-in on `verify`/`policy check`**: with no fingerprints, any valid signature passes and the result says `signer_trusted=None`. Fingerprint provenance is the caller's problem. `signer_identity` remains an unverified claim. No expiry or key-revocation mechanism besides removing the fingerprint. |
+| CI attacker edits the trusted fingerprint or policy inside the same pull request | Example workflow reads the fingerprint from a repository *variable* and the policy from the PR *base* commit, uses `pull_request` (never `pull_request_target`), and `contents: read`. | Static checks only; a team that copies the example and moves the fingerprint/policy into the PR-controlled tree loses this. Workflow untested on a real runner. Actions tag-pinned, not SHA-pinned. Compromise of the ModelGuard revision or of repository-variable write access is out of scope. |
+| Stale cache lets a revoked model through | Cache holds only the digest computation; revocation, signature, trust and policy are recomputed every call. Test: `test_cached_verification_never_overrides_a_new_revocation`. | None specific to caching. (Revocation itself remains opt-in; see limitations.) |
+| Cache returns an old digest for modified files | Metadata fingerprint incl. `ctime` (not settable by unprivileged code) and inode; racy-timestamp margin; stat-hash-stat; strict schema; per-entry consistency check; symlinks/non-regular files/inode 0 bypass the cache. Tests incl. mtime-restoration and same-size edits (mutation-checked). | **Trusts the filesystem.** Defeated by root, raw device writes, clock manipulation; `mmap` writes may lag timestamps; stale attributes on network/FUSE mounts; unsupported off POSIX. Documented in `docs/limitations.md`. Off by default. |
+| Local attacker poisons the cache file | Cache file rejected if a symlink, not owned by the current user, group/world-writable, oversized, or corrupt/schema-mismatched; written `0600` via atomic rename; entry count bounded. | The **same user** (or root) can forge a self-consistent entry; nothing authenticates the cache file. Do not place it where the artifact supplier can write. |
+| Cache growth / corrupt cache as denial of service | 16 MiB file limit, 128-entry cap, any error is a miss, write failures are logged and swallowed. | A very large number of artifacts churning through 128 slots reduces hit rate (performance only). |
+| Admission gate bypassed by a crash, misconfiguration, or an unauditable environment | `admit()` fails closed on: no trust roots, *any* exception, and audit-write failure; requires digest match + trusted signer + allowed decision independent of policy. Tests for each path. | `admit()` is advisory: callers can ignore it. Audit log is single-writer and tail-truncation-blind. Catching `Exception` broadly means a programming bug appears as a denial (surfaced in `reasons`/`error`), which is the intended trade-off. |
+| Check-to-use race: files change between verification and model load | None in code. Documented; example Dockerfile uses root-owned read-only files and non-root user, and its header shows `docker run --read-only`. | **Open.** Any writable path between check and load defeats verification. Also applies to the (unchanged) window between the hash and the scanners' reads inside one `check_policy`. |
+| Misleading "verified" metadata on container images | The Docker example makes **no** verification-status label; id/digest labels are documented as informational. Startup verification is the control. | Consumers may still over-trust labels regardless of documentation. |
+| Redundant double hashing enlarging the tamper window inside `check_policy` | The scan now reuses the digest computed by `verify()`. Test: `test_check_policy_hashes_the_artifact_only_once`. | The window between hashing and the scanners' reads remains (see above). |
+
+## Explicit non-goals of Phase 5
+
+Trust roots prove "a key I listed signed these bytes". They do not prove
+the signer is honest or uncompromised, that the model is safe, or that
+the signer's identity string is truthful. Admission proves the checks
+passed at one moment on one host; it does not sandbox, monitor, or
+constrain the model afterwards.
 
