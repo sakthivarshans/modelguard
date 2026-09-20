@@ -18,27 +18,9 @@ import json
 from pathlib import Path
 
 from modelguard.audit.chain import append_entry, read_all_entries
-from modelguard.exceptions import ModelGuardError
+from modelguard.registry.errors import DuplicateRegistrationError
+from modelguard.registry.identifiers import validate_identifier
 from modelguard.registry.models import RegistryRecord, RevocationRecord
-
-
-class DuplicateRegistrationError(ModelGuardError):
-    """A model_id + version pair was already registered.
-
-    Registries are immutable-by-version: re-registering the same
-    identifier with different contents would let a name silently
-    point to a different artifact, which is exactly the "namespace
-    confusion" threat the architecture document warns about. Register
-    a new version instead.
-    """
-
-    def __init__(self, model_id: str, version: str) -> None:
-        self.model_id = model_id
-        self.version = version
-        super().__init__(
-            f"{model_id}@{version} is already registered. "
-            "Register a new version instead of overwriting an existing one."
-        )
 
 
 class LocalRegistry:
@@ -60,9 +42,14 @@ class LocalRegistry:
         version_path.parent.mkdir(parents=True, exist_ok=True)
         version_path.write_text(record.model_dump_json(indent=2))
 
+        # First registration wins. Registering identical bytes under a
+        # second name must not change what the digest resolves to,
+        # otherwise a later registrant could repoint an immutable
+        # identity at their own name.
         index = self._read_digest_index()
-        index[record.artifact_digest] = {"model_id": record.model_id, "version": record.version}
-        self._write_digest_index(index)
+        if record.artifact_digest not in index:
+            index[record.artifact_digest] = {"model_id": record.model_id, "version": record.version}
+            self._write_digest_index(index)
 
         return record
 
@@ -88,6 +75,8 @@ class LocalRegistry:
     # -- revocation ----------------------------------------------------
 
     def revoke(self, record: RevocationRecord) -> RevocationRecord:
+        validate_identifier(record.model_id, field="model_id")
+        validate_identifier(record.version, field="version")
         append_entry(
             self._revocation_log_path,
             {"action": "revoke", **record.model_dump()},
@@ -95,6 +84,8 @@ class LocalRegistry:
         return record
 
     def unrevoke(self, model_id: str, version: str, actor: str, reason: str) -> None:
+        validate_identifier(model_id, field="model_id")
+        validate_identifier(version, field="version")
         append_entry(
             self._revocation_log_path,
             {
@@ -115,6 +106,8 @@ class LocalRegistry:
         ``unrevoke`` clears an earlier ``revoke``, but the history of
         both remains in the log for audit purposes.
         """
+        validate_identifier(model_id, field="model_id")
+        validate_identifier(version, field="version")
         latest_revoke: RevocationRecord | None = None
         for entry in read_all_entries(self._revocation_log_path):
             r = entry.record
@@ -149,12 +142,10 @@ class LocalRegistry:
 
 
 def _safe_segment(value: str) -> str:
-    """Sanitize a model_id/version for use as a path segment.
+    """Validate a model_id/version before using it as a path segment.
 
-    Rejects path-traversal attempts (``..``, path separators) rather
-    than silently stripping them, consistent with the project's
-    fail-closed path-handling rule.
+    Delegates to the shared registry identifier rules (rejecting, never
+    silently stripping, unsafe input), so every backend agrees on what
+    a valid identifier is.
     """
-    if not value or value in {".", ".."} or "/" in value or "\\" in value:
-        raise ModelGuardError(f"Unsafe registry identifier segment: {value!r}")
-    return value
+    return validate_identifier(value)
