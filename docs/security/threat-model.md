@@ -134,3 +134,30 @@ the signer's identity string is truthful. Admission proves the checks
 passed at one moment on one host; it does not sandbox, monitor, or
 constrain the model afterwards.
 
+## Addendum -- Phase 6 (PostgreSQL registry, object storage)
+
+New trust boundaries: the registry database and the object store are
+**untrusted for integrity of artifact bytes** (digest-verified on every
+read) and **trusted only for revocation availability and freshness**.
+
+| Threat | Mitigation | Residual risk |
+| --- | --- | --- |
+| Registry outage or timeout read as "not revoked" (fail-open) | `RegistryBackendError` on any backend fault; `verify` propagates, `admit()` denies, CLI exits 1. Tests: outage through SDK, admission and CLI. | Availability of revocation checks depends on the database. |
+| Silent fallback from PostgreSQL to the local registry | `--registry-dsn-env` with an unset/empty variable is an error; nothing is written locally. Test: `test_unset_dsn_env_is_an_error_not_a_fallback_to_local`. | Operator omits the flag entirely and gets the local registry (or no revocation check). |
+| DSN or credential disclosure | DSN never in argv (env-var name), `repr`, or exceptions; provider/driver text reduced to a category. Tests assert secrets absent. | Process environment and core dumps are outside scope. |
+| Man-in-the-middle forges revocation answers | Non-local hosts require `sslmode=verify-full`/`verify-ca`; explicit host required. | `allow_insecure_transport=True` exists for tests; misuse in production is possible. |
+| Rewriting registrations or revocations | DB-enforced append-only triggers; UNIQUE(model_id, version); hash-chained revocation events serialized by advisory lock; runtime role limited to SELECT/INSERT. Tests incl. owner-level attempts and concurrent writers. | Owners/superusers can disable triggers; newest-event deletion undetected; records unsigned. |
+| Tampered or substituted schema/migrations | Checksummed migrations; refuse checksum mismatch and newer-than-code schemas. | An owner can rewrite both schema and checksums. |
+| Forged or corrupted registry rows | Strict validation; row content cross-checked against indexed columns. | A privileged user can swap in a different *valid* record. |
+| SQL injection via identifiers or fields | Parameterized queries only; shared identifier validation; test with SQL metacharacters. | None known; never build SQL with string formatting (the only formatted SQL is in test fixtures). |
+| Look-alike names / digest re-pointing | NFC + whitespace/control/path rules; first registration wins for digest resolution (both backends). | Cross-script confusables not blocked. |
+| Tampered or swapped objects in S3 | Every read streamed through SHA-256 against its content address before being kept; size limits enforced while streaming. Tests: tampered blobs, tampered manifests, on local and S3. | Same-digest overwrite denies service. |
+| Path traversal / hostile manifest signed by a malicious publisher | Manifest validated after its hash matches: absolute, `..`, backslash, control, empty/`.` segments, duplicates, file-vs-directory conflicts, non-canonical bytes, wrong sizes, count/size limits all refused; staged in a private directory; no symlinks created; failure removes only staging. | Case-insensitive filesystems can merge paths; Windows untested. |
+| Exfiltration by symlink swap during upload | `O_NOFOLLOW` + `fstat` on the opened descriptor; content re-hashed while uploading and discarded on mismatch. | A read-only window remains between open and hash-check for files the caller can already read. |
+| Plaintext object-store traffic or credentials in URLs | Non-https non-loopback endpoints and userinfo in URLs refused; credentials only via the AWS chain or an injected client. | `allow_insecure_transport=True` for tests. |
+| Misspelled/missing bucket hidden as empty store | One-time `head_bucket` probe on first miss; 403 never reported as absence. | Without HeadBucket/ListBucket permission the distinction can be lost. |
+
+Non-goals: ModelGuard does not sandbox the database or bucket, manage
+their encryption at rest, or authenticate registry *contents* (only the
+artifact signature does that).
+
