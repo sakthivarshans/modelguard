@@ -31,6 +31,13 @@ hook (`modelguard.admission.admit`), and CI / Docker examples under
 `modelguard policy check` allowed tampered artifacts** (only
 `modelguard verify` caught them). See the 0.5.0 CHANGELOG entry.
 
+**Phase 6 (shared registry + object storage):** an optional PostgreSQL
+registry (`--registry-dsn-env`, `modelguard registry migrate`) with
+database-enforced append-only history, and content-addressed artifact
+storage on a local directory or S3-compatible bucket
+(`modelguard artifact push|pull`) where every download is
+hash-verified. Setup: `docs/deployment/postgres.md`.
+
 See `docs/limitations.md` for what is explicitly out of scope so far.
 
 ## Quick start
