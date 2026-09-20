@@ -104,6 +104,15 @@ def _canonical_manifest_bytes(files: list[FileDigest]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def canonical_manifest_bytes(files: list[FileDigest] | tuple[FileDigest, ...]) -> bytes:
+    """The canonical bytes whose SHA-256 is a directory artifact's digest.
+
+    Public so the object-store transfer code can store and re-verify the
+    exact bytes the digest was computed over.
+    """
+    return _canonical_manifest_bytes(list(files))
+
+
 def artifact_digest_from_files(
     artifact_type: str, files: list[FileDigest] | tuple[FileDigest, ...]
 ) -> ArtifactDigest:
