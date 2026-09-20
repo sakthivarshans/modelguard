@@ -43,6 +43,7 @@ from modelguard.provenance.models import ProvenanceEvent, RelationshipType
 from modelguard.provenance.store import LocalProvenanceStore
 from modelguard.registry.local import LocalRegistry
 from modelguard.registry.models import RegistryRecord, RevocationRecord
+from modelguard.registry.protocol import Registry
 from modelguard.scanning import ScanReport, Severity, run_scanners
 from modelguard.signing.envelope import SignatureEnvelope
 from modelguard.signing.keys import LocalKeyPair, load_public_key
@@ -123,6 +124,12 @@ class ModelGuard:
     ``signer_trusted=None``. An empty collection raises
     ``TrustConfigurationError``.
 
+    ``registry`` injects any object implementing the ``Registry``
+    protocol (e.g. ``modelguard.registry.postgres.PostgresRegistry``).
+    When given, it is used for registration, resolution, and the
+    revocation check in ``verify()`` instead of the local file registry.
+    Provenance and audit remain local (``storage_root``).
+
     ``cache_dir`` opts in to the local digest cache
     (``modelguard.cache``); nothing is written to disk for caching
     unless it is set.
@@ -134,8 +141,10 @@ class ModelGuard:
         *,
         cache_dir: str | Path | None = None,
         trusted_key_fingerprints: Iterable[str] | None = None,
+        registry: Registry | None = None,
     ) -> None:
         self._storage_root = Path(storage_root) if storage_root else None
+        self._injected_registry = registry
         self._hasher: CachedHasher | None = CachedHasher(Path(cache_dir)) if cache_dir else None
         self._trusted: frozenset[str] | None = (
             normalize_fingerprints(trusted_key_fingerprints)
@@ -148,8 +157,14 @@ class ModelGuard:
         return self._trusted
 
     @property
-    def registry(self) -> LocalRegistry:
+    def registry(self) -> Registry:
+        if self._injected_registry is not None:
+            return self._injected_registry
         return LocalRegistry(self._require_storage_root() / "registry")
+
+    @property
+    def _has_registry(self) -> bool:
+        return self._injected_registry is not None or self._storage_root is not None
 
     @property
     def provenance_store(self) -> LocalProvenanceStore:
@@ -267,7 +282,7 @@ class ModelGuard:
         # integrity.
         revoked = False
         revocation_checked = False
-        if self._storage_root is not None and envelope.payload.model_id and envelope.payload.version:
+        if self._has_registry and envelope.payload.model_id and envelope.payload.version:
             revocation_checked = True
             revocation = self.registry.is_revoked(
                 envelope.payload.model_id, envelope.payload.version
