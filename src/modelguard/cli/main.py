@@ -10,6 +10,7 @@ CI use and returns a non-zero exit code on failure.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +27,7 @@ from modelguard.mbom.generator import generate_mbom
 from modelguard.mbom.models import MLBOM
 from modelguard.policy.loader import PolicyValidationError, load_policy_file
 from modelguard.policy.models import Decision
+from modelguard.registry.protocol import Registry
 from modelguard.scanning import Finding, ScanReport, Severity, run_scanners
 from modelguard.sdk import ModelGuard
 from modelguard.signing.keys import (
@@ -92,6 +94,57 @@ def _trust_and_cache_options(func: _F) -> _F:
         "with `modelguard fingerprint KEYFILE`. Without any, the signer is NOT checked.",
     )(func)
     return func
+
+
+def _registry_option(func: _F) -> _F:
+    """``--registry-dsn-env``: use a PostgreSQL registry instead of the local one."""
+    return click.option(
+        "--registry-dsn-env",
+        default=None,
+        metavar="ENV_VAR",
+        help="Name of an environment variable holding a PostgreSQL DSN. Uses the PostgreSQL "
+        "registry instead of the local file registry. Pass the NAME, not the DSN: command-line "
+        "arguments are visible to other local users. Requires `pip install modelguard[postgres]`.",
+    )(func)
+
+
+def _registry_from_env(env_name: str | None) -> Registry | None:
+    """Build the PostgreSQL registry named by ``--registry-dsn-env``.
+
+    Fails loudly if the variable is unset or empty -- it must NEVER
+    fall back to the local registry, which could silently skip a
+    revocation the operator believes is being enforced.
+    """
+    if env_name is None:
+        return None
+    dsn = os.environ.get(env_name, "")
+    if not dsn:
+        raise ModelGuardError(
+            f"--registry-dsn-env {env_name}: that environment variable is not set (or is "
+            "empty). Refusing to fall back to the local registry."
+        )
+    try:
+        from modelguard.registry.postgres import PostgresRegistry
+    except ImportError:
+        raise ModelGuardError(
+            'The PostgreSQL registry needs its extra: pip install "modelguard[postgres]"'
+        ) from None
+    return PostgresRegistry(dsn)
+
+
+def _make_guard(
+    storage_root: Path | None,
+    registry_dsn_env: str | None,
+    *,
+    cache_dir: Path | None = None,
+    trusted: tuple[str, ...] = (),
+) -> ModelGuard:
+    return ModelGuard(
+        storage_root=storage_root,
+        cache_dir=cache_dir,
+        trusted_key_fingerprints=trusted or None,
+        registry=_registry_from_env(registry_dsn_env),
+    )
 
 
 @click.group()
@@ -273,12 +326,14 @@ def sign(
     help="Local registry root, to also check revocation status. Omit to skip that check.",
 )
 @_trust_and_cache_options
+@_registry_option
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
 def verify(
     path: Path,
     mbom_path: Path,
     signature_path: Path,
     storage_root: Path | None,
+    registry_dsn_env: str | None,
     trusted_fingerprints: tuple[str, ...],
     cache_dir: Path | None,
     output_format: str,
@@ -291,14 +346,12 @@ def verify(
     signature then only proves *some* key signed the artifact.
     """
     try:
-        guard = ModelGuard(
-            storage_root=storage_root,
-            cache_dir=cache_dir,
-            trusted_key_fingerprints=trusted_fingerprints or None,
+        guard = _make_guard(
+            storage_root, registry_dsn_env, cache_dir=cache_dir, trusted=trusted_fingerprints
         )
+        result = guard.verify(path, mbom_path, signature_path)
     except ModelGuardError as exc:
         _fail(exc, output_format)
-    result = guard.verify(path, mbom_path, signature_path)
 
     if output_format == "json":
         payload = {
@@ -327,7 +380,7 @@ def verify(
         if result.revoked:
             click.echo("Revoked      : YES")
         elif not result.revocation_checked:
-            click.echo("Revocation   : NOT CHECKED (no --storage-root / model identity)")
+            click.echo("Revocation   : NOT CHECKED (no --storage-root/--registry-dsn-env, or no model identity)")
         if result.digest_from_cache:
             click.echo("Digest source: local cache (file metadata unchanged)")
         for reason in result.reasons:
@@ -452,10 +505,17 @@ def _print_scan_report_text(report: ScanReport) -> None:
 @click.argument("mbom_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--actor", required=True, help="Identity performing the registration.")
 @click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
-def register(manifest_path: Path, mbom_path: Path, actor: str, storage_root: Path) -> None:
-    """Register a manifest + ML-BOM pair in the local registry."""
-    guard = ModelGuard(storage_root=storage_root)
+@_registry_option
+def register(
+    manifest_path: Path,
+    mbom_path: Path,
+    actor: str,
+    storage_root: Path,
+    registry_dsn_env: str | None,
+) -> None:
+    """Register a manifest + ML-BOM pair in the registry (local unless --registry-dsn-env)."""
     try:
+        guard = _make_guard(storage_root, registry_dsn_env)
         m = Manifest.model_validate(json.loads(manifest_path.read_text()))
         bom = MLBOM.model_validate(json.loads(mbom_path.read_text()))
         record = guard.register(m, bom, actor=actor)
@@ -470,17 +530,27 @@ def register(manifest_path: Path, mbom_path: Path, actor: str, storage_root: Pat
 @click.argument("model_id")
 @click.argument("version")
 @click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
+@_registry_option
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
-def resolve(model_id: str, version: str, storage_root: Path, output_format: str) -> None:
+def resolve(
+    model_id: str,
+    version: str,
+    storage_root: Path,
+    registry_dsn_env: str | None,
+    output_format: str,
+) -> None:
     """Resolve a registered model_id@version to its record."""
-    guard = ModelGuard(storage_root=storage_root)
-    record = guard.resolve(model_id, version)
+    try:
+        guard = _make_guard(storage_root, registry_dsn_env)
+        record = guard.resolve(model_id, version)
+        revocation = guard.is_revoked(model_id, version) if record is not None else None
+    except ModelGuardError as exc:
+        _fail(exc, output_format)
 
     if record is None:
         click.echo(f"Error: {model_id}@{version} is not registered", err=True)
         sys.exit(EXIT_ERROR)
 
-    revocation = guard.is_revoked(model_id, version)
     if output_format == "json":
         payload = {
             "model_id": record.model_id,
@@ -502,10 +572,21 @@ def resolve(model_id: str, version: str, storage_root: Path, output_format: str)
 @click.option("--actor", required=True)
 @click.option("--reason", required=True)
 @click.option("--storage-root", type=click.Path(path_type=Path), default=_DEFAULT_STORAGE_ROOT)
-def revoke(model_id: str, version: str, actor: str, reason: str, storage_root: Path) -> None:
+@_registry_option
+def revoke(
+    model_id: str,
+    version: str,
+    actor: str,
+    reason: str,
+    storage_root: Path,
+    registry_dsn_env: str | None,
+) -> None:
     """Revoke a registered model version."""
-    guard = ModelGuard(storage_root=storage_root)
-    guard.revoke(model_id, version, actor=actor, reason=reason)
+    try:
+        guard = _make_guard(storage_root, registry_dsn_env)
+        guard.revoke(model_id, version, actor=actor, reason=reason)
+    except ModelGuardError as exc:
+        _fail(exc, "text")
     click.echo(f"Revoked {model_id}@{version}: {reason}")
 
 
@@ -605,6 +686,7 @@ def policy_validate(policy_path: Path) -> None:
     help="Local registry root, to also check revocation status.",
 )
 @_trust_and_cache_options
+@_registry_option
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
 def policy_check(
     path: Path,
@@ -612,6 +694,7 @@ def policy_check(
     signature_path: Path,
     policy_file: Path,
     storage_root: Path | None,
+    registry_dsn_env: str | None,
     trusted_fingerprints: tuple[str, ...],
     cache_dir: Path | None,
     output_format: str,
@@ -622,10 +705,8 @@ def policy_check(
     3 = REVIEW_REQUIRED, 4 = QUARANTINE, 5 = REVOKED, 1 = error.
     """
     try:
-        guard = ModelGuard(
-            storage_root=storage_root,
-            cache_dir=cache_dir,
-            trusted_key_fingerprints=trusted_fingerprints or None,
+        guard = _make_guard(
+            storage_root, registry_dsn_env, cache_dir=cache_dir, trusted=trusted_fingerprints
         )
         result = guard.check_policy(path, mbom_path, signature_path, policy_file)
     except ModelGuardError as exc:
@@ -661,3 +742,141 @@ def _fail(exc: ModelGuardError, output_format: str) -> None:
 
 if __name__ == "__main__":
     cli()
+
+
+@cli.group()
+def registry() -> None:
+    """Administer a PostgreSQL registry."""
+
+
+@registry.command("migrate")
+@click.option("--dsn-env", required=True, metavar="ENV_VAR", help="Env var holding an OWNER-role DSN.")
+def registry_migrate(dsn_env: str) -> None:
+    """Apply pending schema migrations (run as the owner role, not the runtime role)."""
+    try:
+        reg = _registry_from_env(dsn_env)
+        applied = reg.migrate() if reg is not None and hasattr(reg, "migrate") else []
+    except ModelGuardError as exc:
+        _fail(exc, "text")
+    click.echo(f"Applied migrations: {applied}" if applied else "Schema is up to date.")
+
+
+@registry.command("verify-chain")
+@click.option("--dsn-env", required=True, metavar="ENV_VAR")
+def registry_verify_chain(dsn_env: str) -> None:
+    """Verify the revocation event hash chain. Exit 0 intact, 2 tampered, 1 error."""
+    from modelguard.audit.chain import ChainIntegrityError
+
+    try:
+        reg = _registry_from_env(dsn_env)
+        if reg is None or not hasattr(reg, "verify_revocation_chain"):
+            raise ModelGuardError("This registry does not support chain verification.")
+        reg.verify_revocation_chain()
+    except ChainIntegrityError as exc:
+        click.echo(f"TAMPERED: {exc}", err=True)
+        sys.exit(EXIT_DENIED)
+    except ModelGuardError as exc:
+        _fail(exc, "text")
+    click.echo("Revocation chain intact.")
+
+
+def _blob_store(bucket: str | None, prefix: str, endpoint_url: str | None, region: str | None, local_store: Path | None) -> Any:
+    if (bucket is None) == (local_store is None):
+        raise ModelGuardError("Give exactly one of --bucket (S3) or --local-store DIR.")
+    if local_store is not None:
+        from modelguard.storage import LocalBlobStore
+
+        return LocalBlobStore(local_store)
+    try:
+        from modelguard.storage.s3 import S3BlobStore
+    except ImportError:
+        raise ModelGuardError('S3 support needs its extra: pip install "modelguard[s3]"') from None
+    assert bucket is not None
+    return S3BlobStore(bucket, prefix=prefix, endpoint_url=endpoint_url, region_name=region)
+
+
+def _store_options(func: _F) -> _F:
+    for opt in reversed(
+        [
+            click.option("--bucket", default=None, help="S3 bucket (credentials come from the standard AWS chain)."),
+            click.option("--prefix", default="", help="Key prefix inside the bucket."),
+            click.option("--endpoint-url", default=None, help="S3-compatible endpoint (https, or loopback)."),
+            click.option("--region", default=None),
+            click.option("--local-store", type=click.Path(path_type=Path), default=None, help="Use a local blob directory instead of S3."),
+        ]
+    ):
+        func = opt(func)
+    return func
+
+
+@cli.group()
+def artifact() -> None:
+    """Move artifacts to and from content-addressed object storage."""
+
+
+@artifact.command("push")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@_store_options
+def artifact_push(
+    path: Path,
+    bucket: str | None,
+    prefix: str,
+    endpoint_url: str | None,
+    region: str | None,
+    local_store: Path | None,
+) -> None:
+    """Hash PATH (refusing symlinks) and upload it. Prints the artifact digest."""
+    from modelguard.storage import upload_artifact
+
+    try:
+        store = _blob_store(bucket, prefix, endpoint_url, region, local_store)
+        digest = upload_artifact(store, path)
+    except ModelGuardError as exc:
+        _fail(exc, "text")
+    click.echo(f"sha256:{digest.digest}")
+    click.echo(f"type: {digest.artifact_type}", err=True)
+
+
+@artifact.command("pull")
+@click.argument("digest")
+@click.argument("dest", type=click.Path(path_type=Path))
+@click.option("--type", "artifact_type", type=click.Choice(["file", "directory"]), required=True)
+@click.option("--max-total-bytes", type=int, default=None)
+@click.option("--max-files", type=int, default=None)
+@_store_options
+def artifact_pull(
+    digest: str,
+    dest: Path,
+    artifact_type: str,
+    max_total_bytes: int | None,
+    max_files: int | None,
+    bucket: str | None,
+    prefix: str,
+    endpoint_url: str | None,
+    region: str | None,
+    local_store: Path | None,
+) -> None:
+    """Download and verify DIGEST (sha256:<hex>) to DEST, which must not exist.
+
+    Take DIGEST from a source you trust (a verified signature or registry
+    record). Exit 0 on success, 2 if the stored data failed verification.
+    """
+    from modelguard.storage import ArtifactIntegrityError, download_artifact
+    from modelguard.storage.transfer import DEFAULT_MAX_FILES, DEFAULT_MAX_TOTAL_BYTES
+
+    try:
+        store = _blob_store(bucket, prefix, endpoint_url, region, local_store)
+        download_artifact(
+            store,
+            digest,
+            artifact_type,
+            dest,
+            max_total_bytes=max_total_bytes or DEFAULT_MAX_TOTAL_BYTES,
+            max_files=max_files or DEFAULT_MAX_FILES,
+        )
+    except ArtifactIntegrityError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(EXIT_DENIED)
+    except ModelGuardError as exc:
+        _fail(exc, "text")
+    click.echo(f"Downloaded and verified {digest} -> {dest}")
