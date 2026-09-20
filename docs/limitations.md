@@ -115,13 +115,12 @@ not assume it works.
   revocation** -- `reject_revoked_models` is the only rule connected to
   Phase 2's registry. Scanning is now integrated (Phase 4), but risk
   classification and license allow-lists are not.
-- **No PostgreSQL, S3, or FastAPI service.** Phase 2's registry and
-  provenance store are local, file-backed implementations behind
-  `Protocol` interfaces (`Registry`, and an implicit provenance-store
-  shape) -- nothing is shared across machines or served over a
-  network yet. Concurrent writers to the same `storage_root` are not
-  safe (no file locking); this is a single-writer, single-machine
-  implementation.
+- **No FastAPI service.** Nothing is served over a network by
+  ModelGuard itself. The registry can be shared across machines via the
+  optional PostgreSQL adapter (Phase 6), but **provenance and audit logs
+  are still local, file-backed, and single-writer** (no file locking):
+  concurrent writers to the same `storage_root` are not safe. The local
+  registry is likewise single-machine, single-writer.
 - **No provenance graph database.** `lineage`/`parents`/`children`/
   `find_models_derived_from` are in-memory traversals over the full
   event log on every call. This is fine at the scale a local file
@@ -246,7 +245,8 @@ not assume it works.
   the `reject_revoked_models` rule itself still reports "not revoked"
   when nothing was checked -- a known imprecision in its message. A
   deploy target with no access to a registry gets no revocation
-  protection until the PostgreSQL/registry-service phase.
+  protection; Phase 6's PostgreSQL registry (`--registry-dsn-env`) makes a
+  shared registry possible, but it is still opt-in.
 - **`admit()` is a function, not an enforcement point.** Nothing stops
   a caller ignoring `admitted=False`. There is no Kubernetes webhook,
   no server, no rate limiting. The admission audit log is the same
@@ -272,3 +272,67 @@ not assume it works.
   leaves `artifact_digest_matches=None` skips the integrity gate (kept
   for compatibility with pre-0.5.0 hand-built contexts). `build_context`
   and `check_policy` always set it. Prefer them.
+
+## Phase 6: PostgreSQL registry and object storage
+
+See `docs/deployment/postgres.md` for setup (roles, grants, TLS).
+
+### Implemented
+
+- `modelguard.registry.postgres.PostgresRegistry` (extra: `postgres`),
+  with versioned, checksummed migrations, database-enforced append-only
+  history, a hash-chained revocation log, transport policy, and
+  fail-closed errors. Identical behavior to `LocalRegistry` is enforced
+  by a shared contract test suite.
+- `modelguard.storage`: a content-addressed `BlobStore` protocol,
+  `LocalBlobStore`, `S3BlobStore` (extra: `s3`), and
+  `upload_artifact` / `download_artifact` with full re-verification.
+- CLI: `--registry-dsn-env` on `verify`, `policy check`, `register`,
+  `resolve`, `revoke`; `registry migrate|verify-chain`;
+  `artifact push|pull`.
+- `LocalRegistry` behavior changes made to unify the contract:
+  first-registration-wins digest resolution, shared identifier
+  validation, strict `sha256:<64 hex>` digests.
+
+### Not implemented / limits
+
+- **Not a service.** Each operation opens one short-lived database
+  connection (no pooling). Throughput is bounded by connection setup.
+- **Database owners and superusers defeat immutability.** The triggers
+  and hash chain stop application bugs and stolen *application-role*
+  credentials, and make edits detectable; a table owner can disable the
+  triggers (the tests do exactly this to simulate the attacker). Like
+  the local logs, the chain cannot detect deletion of the *newest*
+  events. Use separate owner and runtime roles.
+- **Provenance and audit remain local**, so the admission audit trail
+  and lineage are not shared across hosts.
+- **Only the registry, not artifacts, is trusted less.** The registry
+  holds manifests/ML-BOMs and revocations, not model bytes; a compromised
+  registry can withhold a revocation (denial of protection) even though
+  it cannot forge a valid signature. Revocation freshness is only as good
+  as the registry's availability and the network path to it.
+- **Registry records are unauthenticated data.** Records are validated
+  and cross-checked against indexed columns, but they are not signed; a
+  privileged DB user can substitute a *different valid* record for a
+  version. Trust for the artifact still comes from the signature, not
+  the registry.
+- **Identifier look-alikes across scripts** (e.g. Cyrillic vs Latin
+  letters) are not blocked; only NFC normalization, control characters,
+  whitespace, length and path characters are.
+- **S3: integrity yes, availability and confidentiality no.** Every read
+  is hash-verified, so a tampered or swapped object is refused -- but a
+  same-digest overwrite with bad bytes denies service until repaired.
+  Bucket policy, encryption at rest, versioning/Object Lock, and lifecycle
+  rules are the deployer's job.
+- **A store that is missing an object is not distinguishable from a
+  bucket you cannot see**: 403 raises (never "absent"), but with
+  restricted permissions a missing bucket may be reported as a missing
+  blob. Grant `s3:ListBucket` so S3 returns 404 for missing keys.
+- **Downloads are private (0600/0700)** and case-insensitive filesystems
+  can merge paths that differ only by case; Windows is untested.
+- **Limits are defaults, not guarantees**: 256 GiB total, 100,000 files,
+  64 MiB manifest. Tune per deployment.
+- **Test coverage of S3 is against moto** (a real HTTP server
+  implementing the S3 API), not against AWS or MinIO; PostgreSQL tests
+  run against a real PostgreSQL 16 but only when
+  `MODELGUARD_TEST_POSTGRES_DSN` is set (otherwise visibly skipped).
