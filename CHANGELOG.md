@@ -4,6 +4,58 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.6.0] - Phase 6: PostgreSQL registry and object storage
+
+### Added
+
+- **`PostgresRegistry`** (`modelguard.registry.postgres`, extra
+  `postgres`): registry backend on PostgreSQL with checksummed
+  migrations, append-only history enforced by database triggers,
+  hash-chained revocation events (advisory-lock serialized), verifying
+  TLS required for remote hosts, secret-free errors, and fail-closed
+  `RegistryBackendError`. Setup guide: `docs/deployment/postgres.md`.
+- **`modelguard.storage`**: `BlobStore` protocol, `LocalBlobStore`,
+  `S3BlobStore` (extra `s3`; AWS S3 / MinIO-style endpoints), and
+  `upload_artifact` / `download_artifact`. Content-addressed; every
+  read is hash-verified; hostile manifests are validated after their
+  hash matches; downloads are staged and renamed atomically.
+- `ModelGuard(registry=...)` accepts any `Registry` implementation;
+  `verify()` uses it for the revocation check.
+- CLI: `--registry-dsn-env` (verify, policy check, register, resolve,
+  revoke); `registry migrate`, `registry verify-chain`; `artifact push`,
+  `artifact pull`.
+- Shared contract test suites: one `Registry` contract run against both
+  backends, one `BlobStore` contract run against local and S3.
+- `registry.identifiers.validate_identifier`, `registry.errors`,
+  `hashing.canonical_manifest_bytes`.
+
+### Changed (behavior)
+
+- **`LocalRegistry`: first registration wins for digest lookups.**
+  Previously a later registration of identical bytes under another name
+  silently repointed the digest index -- a name-confusion vector.
+- **Stricter identifiers** for `model_id`/`version` on every backend:
+  <= 200 chars, no control characters, no leading/trailing whitespace,
+  NFC-normalized, no path separators. Existing local registries holding
+  identifiers outside these rules can no longer be read.
+- `RegistryRecord.artifact_digest` must match `sha256:<64 lowercase hex>`.
+- `resolve` and `revoke` now report backend errors cleanly (exit 1)
+  instead of raising a traceback.
+- `DuplicateRegistrationError` moved to `modelguard.registry.errors`
+  (still importable from `modelguard.registry` and `...registry.local`).
+
+### Fixed
+
+- S3 answers `HEAD` on a missing bucket with a bodiless 404; a
+  misspelled bucket is now reported as "bucket not found" rather than
+  as an empty store.
+
+### Not done
+
+- Provenance and audit logs remain local and single-writer.
+- No connection pooling; no HTTP service.
+- Not tested against AWS or MinIO (moto only); see `docs/limitations.md`.
+
 ## [0.5.0] - Phase 5: CI/CD, caching, admission, trust roots
 
 ### SECURITY FIX -- read this first
