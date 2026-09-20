@@ -37,7 +37,7 @@ class RegistryRecord(BaseModel):
 
     model_id: str
     version: str
-    artifact_digest: str  # "sha256:<hex>", copied from manifest for fast lookup
+    artifact_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")  # copied from manifest
     manifest: Manifest
     mbom: MLBOM
     registered_by: str
