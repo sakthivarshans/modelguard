@@ -4,6 +4,104 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.7.0] - Phase 7 slice 7a: signature-scheme plumbing
+
+### Added
+
+- **`modelguard.signing.schemes`**: a pluggable signature-scheme
+  registry, decoupled from key custody. Ships `ed25519` (unchanged
+  behavior) and a new `ecdsa-p256-sha256` (uncompressed SEC1 public
+  key; DER `ECDSA-Sig-Value` signature; SHA-256). `verifier_registry()`
+  builds an extended, still-immutable registry; it refuses to let a
+  caller replace a built-in scheme.
+- **`modelguard.signing.providers.SignerProvider`**: a small protocol
+  (`algorithm`, `identity`, `public_key()`, `sign(message)`) so a
+  signature can be produced by something other than a local private key
+  file. `LocalEd25519Signer` adapts the existing local-key path onto it.
+  `ModelGuard.sign_with_provider()` and
+  `modelguard.signing.sign_with_provider()` are new entry points;
+  `ModelGuard.sign()` / `sign_artifact()` are unchanged wrappers around
+  it and still produce Ed25519 signatures by default.
+- **Signature format version 2**: the signed payload now additionally
+  covers `signature_algorithm` and `key_id` (SHA-256 fingerprint of the
+  signing public key), so neither can be swapped post-signing without
+  invalidating the signature. `sign_with_provider()` always produces
+  version 2. `verify_envelope_signature()` returns a `SignatureCheck`
+  (algorithm, key fingerprint, format version, whether the key was
+  signature-bound) computed from what actually verified, not from
+  unverified claims.
+- **`load_envelope()`**: a single, bounded signature-file loader (size
+  cap before parsing, strict UTF-8, unknown fields rejected) used by
+  the SDK and CLI, replacing ad hoc `json.loads` + `model_validate`
+  call sites. Malformed files now raise the new
+  `MalformedSignatureError` instead of a raw `json`/pydantic exception.
+- **New exceptions**: `UnsupportedSignatureSchemeError` (subclass of
+  `SignatureInvalidError` -- an unknown scheme denies exactly like an
+  invalid signature), `MalformedSignatureError`, `SigningProviderError`.
+- CLI: `--reject-legacy-signatures` on `verify` and `policy check`
+  (refuses format-version-1 signatures); `verify` now prints/returns
+  the verifying `signature_algorithm` and `signer_key_fingerprint`.
+- SDK: `ModelGuard(allow_legacy_signatures=False)`;
+  `VerificationResult.signature_algorithm` /
+  `.signer_key_fingerprint`.
+- `tests/fixtures/legacy_signature_0_6_0/`: a signature produced by the
+  unmodified 0.6.0 signer, checked in as a permanent backward-
+  compatibility regression fixture. Never regenerate it with current
+  code.
+
+### Backward compatibility
+
+- Format-version-1 (pre-0.7.0) signatures are unaffected: the new
+  payload fields are omitted (not null) when unset, so the canonical
+  JSON that was actually signed is byte-for-byte identical to before,
+  and old signatures verify unchanged. They can be explicitly refused
+  with `--reject-legacy-signatures` / `allow_legacy_signatures=False`.
+- `check_signature_bytes()` keeps its old signature and behavior; it
+  now delegates to `verify_envelope_signature()` internally.
+- Ed25519 key fingerprints are computed the same way (SHA-256 of the
+  raw 32-byte public key); existing `--trusted-fingerprint` values and
+  trust configuration keep working unchanged.
+
+### Security
+
+- Closes an algorithm-confusion gap: previously the unsigned
+  `signature_type` field was the only indication of which scheme
+  verified a signature. A version-2 payload now signs the algorithm
+  itself, and the unsigned label is checked for agreement, not trusted.
+- Closes a key-substitution gap: a version-2 payload signs the
+  fingerprint of the intended signing key (`key_id`); the verifier
+  recomputes the fingerprint from the actual key bytes used and
+  compares, rather than trusting whatever key accompanies the
+  signature.
+- `sign_with_provider()` re-verifies the envelope it produces against
+  the provider's own reported public key before returning it, so a
+  provider that signs with a different key than it reports (e.g. a
+  repointed KMS alias) fails at signing time, not silently.
+- Provider exceptions are normalized to `SigningProviderError` carrying
+  only the exception type name, with the original cause suppressed, so
+  KMS/HSM error text (which can carry ARNs, key IDs, or tokens) never
+  reaches logs or CLI output through this path.
+- See `docs/security/threat-model.md` (Phase 7 slice 7a addendum) for
+  the specific threats, mitigations, and residual risks, and
+  `docs/limitations.md` for what this slice explicitly does not cover
+  (trust configuration, key rotation, KMS, HSM, Sigstore -- later
+  slices).
+
+### Testing
+
+- 75 new tests (unit + security): scheme verifiers (round trips, wrong
+  lengths, wrong keys, malformed DER, compressed/off-curve points),
+  provider contract and fail-closed paths (leaking exception text,
+  mismatched key/signature, unusable return values), envelope-parsing
+  attacks (oversized files, deep nesting, non-UTF-8, unknown fields),
+  algorithm-confusion and downgrade attempts in both directions,
+  key-substitution, and full backward-compatibility checks against the
+  checked-in 0.6.0 fixture.
+- The riskiest checks (key-substitution binding, algorithm-label
+  binding, legacy-scheme fixing) were mutation-checked: each check was
+  deliberately removed, confirmed to make its guarding test fail, then
+  restored. All three mutants were caught.
+
 ## [0.6.0] - Phase 6: PostgreSQL registry and object storage
 
 ### Added
