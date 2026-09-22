@@ -1,0 +1,32 @@
+{
+  "bom_format": "CycloneDX",
+  "spec_version": "1.6",
+  "schema_version": "1",
+  "serial_number": "urn:uuid:5d35a324-dfa3-4ee9-b0cf-ddec387e4d65",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-09-20T14:31:59.683747+00:00",
+    "tool_name": "modelguard",
+    "tool_version": "0.6.0"
+  },
+  "components": [
+    {
+      "type": "machine-learning-model",
+      "name": "model",
+      "version": "0.6.0"
+    }
+  ],
+  "modelguard": {
+    "artifact_digest": "sha256:9e78ba6a622117442bb538115f0597956793a5e29083b06e3ba2d9b64169e7a2",
+    "artifact_type": "directory",
+    "parent_models": [],
+    "dataset_references": [],
+    "training_code_commit": null,
+    "framework": null,
+    "license": {
+      "value": "Apache-2.0",
+      "evidence": "DECLARED"
+    },
+    "trust_status": "unknown"
+  }
+}
