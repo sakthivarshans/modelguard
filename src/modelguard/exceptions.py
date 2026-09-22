@@ -111,6 +111,33 @@ class SignatureInvalidError(VerificationError):
     """The cryptographic signature does not match the signed payload."""
 
 
+class UnsupportedSignatureSchemeError(SignatureInvalidError):
+    """The signature uses a scheme, algorithm, or format version this
+    verifier does not implement or has been configured to refuse.
+
+    A subclass of ``SignatureInvalidError`` on purpose: code that
+    already denies on an invalid signature also denies on an unknown
+    one. An unrecognized scheme is never treated as "probably fine".
+    """
+
+
+class MalformedSignatureError(VerificationError):
+    """A signature file could not be parsed into a signature envelope
+    (not JSON, wrong types, unknown fields, or over the size limit).
+
+    Distinct from ``SignatureInvalidError``: nothing was verified
+    because there was no well-formed envelope to verify.
+    """
+
+
+class SigningProviderError(SigningError):
+    """A signing provider (local key, KMS, HSM, ...) failed, returned
+    something unusable, or returned a signature that does not verify
+    against its own public key. Signing fails closed: no envelope is
+    produced.
+    """
+
+
 class DigestMismatchError(VerificationError):
     """The artifact's current digest does not match the signed digest.
 
