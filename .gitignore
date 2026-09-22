@@ -10,5 +10,6 @@ build/
 *.modelguard.key
 *.modelguard.pub
 *.sig.json
+!tests/fixtures/**/*.sig.json
 htmlcov/
 .coverage

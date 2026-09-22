@@ -1,0 +1,14 @@
+{
+  "signature_type": "ed25519-local",
+  "payload": {
+    "schema_version": "1",
+    "artifact_digest": "sha256:9e78ba6a622117442bb538115f0597956793a5e29083b06e3ba2d9b64169e7a2",
+    "mbom_digest": "sha256:138697a315174a21ec74f34b274583371244dbe8ba2abd1b8947be596cb3547d",
+    "model_id": "legacy-fixture",
+    "version": "0.6.0",
+    "signer_identity": "fixture@modelguard.invalid",
+    "signed_at": "2026-09-20T14:31:59.683851+00:00"
+  },
+  "signature": "14d58e40150df79ef3c890cdc652980ee8babe16837419edd4254bbba8edb7d26fa49ec9f719317e2209323995fc2cf437369dc79d214bc954dfd77a2da1fc01",
+  "public_key": "a2877776e905719bd83a39e64eb032236c5a4b5664a40e9877c3a9583534bbe3"
+}
