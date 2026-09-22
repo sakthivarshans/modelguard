@@ -10,17 +10,32 @@ the framework's central guarantee.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-from modelguard.exceptions import DigestMismatchError, SignatureInvalidError
+from modelguard.exceptions import (
+    DigestMismatchError,
+    SignatureInvalidError,
+    UnsupportedSignatureSchemeError,
+)
 from modelguard.hashing.digest import ArtifactDigest, hash_artifact
 from modelguard.mbom.models import MLBOM
-from modelguard.signing.envelope import SignatureEnvelope
+from modelguard.signing.envelope import (
+    SCHEMA_VERSION_BOUND,
+    SCHEMA_VERSION_LEGACY,
+    SIGNATURE_TYPE_ED25519_LOCAL,
+    SignatureEnvelope,
+)
+from modelguard.signing.schemes import (
+    ALGORITHM_ED25519,
+    DEFAULT_VERIFIERS,
+    MAX_KEY_BYTES,
+    MAX_SIGNATURE_BYTES,
+    SignatureVerifier,
+    decode_hex_strict,
+    key_fingerprint,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,28 +47,127 @@ class TamperCheckResult:
     matches: bool
 
 
-def check_signature_bytes(envelope: SignatureEnvelope) -> None:
+@dataclass(frozen=True, slots=True)
+class SignatureCheck:
+    """What a successful signature verification established.
+
+    ``key_fingerprint`` is computed from the public key bytes that
+    actually verified the signature -- not read from any claimed field.
+    ``key_bound`` says whether the signed payload itself committed to
+    that key (format version 2). A valid signature still says nothing
+    about whether the key is *trusted*; that is a separate check against
+    a trust configuration.
+    """
+
+    algorithm: str
+    key_fingerprint: str
+    format_version: str
+    key_bound: bool
+
+
+def verify_envelope_signature(
+    envelope: SignatureEnvelope,
+    verifiers: Mapping[str, SignatureVerifier] = DEFAULT_VERIFIERS,
+    *,
+    allow_legacy_v1: bool = True,
+) -> SignatureCheck:
+    """Verify the signature over the payload, failing closed on anything odd.
+
+    Order matters and is deliberate: the scheme is fixed by *signed*
+    data (version 2) or by the one legacy value (version 1) **before**
+    any key or signature byte is interpreted, and the unsigned
+    ``signature_type`` can only agree with that, never override it.
+
+    Raises ``UnsupportedSignatureSchemeError`` for an unknown format
+    version, unknown algorithm, or a legacy signature when
+    ``allow_legacy_v1`` is False; raises ``SignatureInvalidError`` for
+    any inconsistency or cryptographic failure.
+
+    This does NOT check that the key is trusted.
+    """
+    payload = envelope.payload
+    version = payload.schema_version
+
+    if version == SCHEMA_VERSION_LEGACY:
+        if not allow_legacy_v1:
+            raise UnsupportedSignatureSchemeError(
+                "This is a legacy (format version 1) signature, which this verifier is "
+                "configured to refuse because it does not commit to the signing key. "
+                "Re-sign the artifact with ModelGuard 0.7.0 or later."
+            )
+        if payload.signature_algorithm is not None or payload.key_id is not None:
+            raise SignatureInvalidError(
+                "A format version 1 payload must not carry signature_algorithm or key_id."
+            )
+        if envelope.signature_type != SIGNATURE_TYPE_ED25519_LOCAL:
+            raise UnsupportedSignatureSchemeError(
+                f"Unsupported legacy signature_type {envelope.signature_type!r}; "
+                f"only {SIGNATURE_TYPE_ED25519_LOCAL!r} exists for format version 1."
+            )
+        algorithm = ALGORITHM_ED25519
+        claimed_key_id: str | None = None
+    elif version == SCHEMA_VERSION_BOUND:
+        if payload.signature_algorithm is None or payload.key_id is None:
+            raise SignatureInvalidError(
+                "A format version 2 payload must carry both signature_algorithm and key_id."
+            )
+        if envelope.signature_type != payload.signature_algorithm:
+            raise SignatureInvalidError(
+                f"The envelope labels the signature {envelope.signature_type!r} but the signed "
+                f"payload says {payload.signature_algorithm!r}. The unsigned label was altered "
+                "or the envelope was assembled incorrectly."
+            )
+        algorithm = payload.signature_algorithm
+        claimed_key_id = payload.key_id
+    else:
+        raise UnsupportedSignatureSchemeError(
+            f"Unsupported signature format version {version!r}; this verifier understands "
+            f"{SCHEMA_VERSION_LEGACY!r} and {SCHEMA_VERSION_BOUND!r}."
+        )
+
+    verifier = verifiers.get(algorithm)
+    if verifier is None:
+        raise UnsupportedSignatureSchemeError(
+            f"Signature algorithm {algorithm!r} is not supported by this verifier "
+            f"(supported: {', '.join(sorted(verifiers))})."
+        )
+
+    public_key = decode_hex_strict(envelope.public_key, what="public_key", max_bytes=MAX_KEY_BYTES)
+    signature = decode_hex_strict(envelope.signature, what="signature", max_bytes=MAX_SIGNATURE_BYTES)
+    fingerprint = key_fingerprint(public_key)
+
+    if claimed_key_id is not None and claimed_key_id != fingerprint:
+        raise SignatureInvalidError(
+            f"The signed payload commits to key_id {claimed_key_id!r} but the envelope carries "
+            f"a public key with fingerprint {fingerprint!r}. The key was substituted."
+        )
+
+    verifier.verify(public_key, signature, payload.canonical_json())
+
+    return SignatureCheck(
+        algorithm=algorithm,
+        key_fingerprint=fingerprint,
+        format_version=version,
+        key_bound=claimed_key_id is not None,
+    )
+
+
+def check_signature_bytes(
+    envelope: SignatureEnvelope,
+    verifiers: Mapping[str, SignatureVerifier] = DEFAULT_VERIFIERS,
+    *,
+    allow_legacy_v1: bool = True,
+) -> None:
     """Verify the cryptographic signature over the payload.
 
-    Raises ``SignatureInvalidError`` if the signature does not verify
-    against the embedded public key. This function does NOT check
-    whether that public key is trusted -- that is a policy decision,
-    not a cryptography one (Phase 3 adds trust-root configuration).
+    Raises ``SignatureInvalidError`` (or its subclass
+    ``UnsupportedSignatureSchemeError``) on any failure. This function
+    does NOT check whether the signing key is trusted -- that is a
+    separate decision made against a trust configuration. Use
+    ``verify_envelope_signature`` when you need the algorithm and key
+    fingerprint that verified.
     """
-    try:
-        public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(envelope.public_key))
-        public_key.verify(
-            bytes.fromhex(envelope.signature),
-            envelope.payload.canonical_json(),
-        )
-    except InvalidSignature as exc:
-        raise SignatureInvalidError(
-            "Signature does not match the signed payload. The payload or "
-            "signature bytes may have been altered, or the wrong public "
-            "key was supplied."
-        ) from exc
-    except ValueError as exc:
-        raise SignatureInvalidError(f"Malformed signature or key data: {exc}") from exc
+    verify_envelope_signature(envelope, verifiers, allow_legacy_v1=allow_legacy_v1)
 
 
 def check_artifact_digest(
