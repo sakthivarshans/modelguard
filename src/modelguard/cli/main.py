@@ -87,6 +87,14 @@ def _trust_and_cache_options(func: _F) -> _F:
         "artifact's supplier cannot write; see docs/limitations.md.",
     )(func)
     func = click.option(
+        "--reject-legacy-signatures",
+        "reject_legacy_signatures",
+        is_flag=True,
+        default=False,
+        help="Refuse format-version-1 signatures (ModelGuard <= 0.6.0), which do not commit to "
+        "the signing key. Use once everything is re-signed with 0.7.0 or later.",
+    )(func)
+    func = click.option(
         "--trusted-fingerprint",
         "trusted_fingerprints",
         multiple=True,
@@ -138,8 +146,10 @@ def _make_guard(
     *,
     cache_dir: Path | None = None,
     trusted: tuple[str, ...] = (),
+    reject_legacy_signatures: bool = False,
 ) -> ModelGuard:
     return ModelGuard(
+        allow_legacy_signatures=not reject_legacy_signatures,
         storage_root=storage_root,
         cache_dir=cache_dir,
         trusted_key_fingerprints=trusted or None,
@@ -335,6 +345,7 @@ def verify(
     storage_root: Path | None,
     registry_dsn_env: str | None,
     trusted_fingerprints: tuple[str, ...],
+    reject_legacy_signatures: bool,
     cache_dir: Path | None,
     output_format: str,
 ) -> None:
@@ -347,7 +358,11 @@ def verify(
     """
     try:
         guard = _make_guard(
-            storage_root, registry_dsn_env, cache_dir=cache_dir, trusted=trusted_fingerprints
+            storage_root,
+            registry_dsn_env,
+            cache_dir=cache_dir,
+            trusted=trusted_fingerprints,
+            reject_legacy_signatures=reject_legacy_signatures,
         )
         result = guard.verify(path, mbom_path, signature_path)
     except ModelGuardError as exc:
@@ -359,6 +374,8 @@ def verify(
             "artifact_digest": result.artifact_digest,
             "digest_matches": result.digest_matches,
             "signature_valid": result.signature_valid,
+            "signature_algorithm": result.signature_algorithm,
+            "signer_key_fingerprint": result.signer_key_fingerprint,
             "signer_trusted": result.signer_trusted,
             "mbom_valid": result.mbom_valid,
             "revoked": result.revoked,
@@ -372,6 +389,9 @@ def verify(
         click.echo(f"Verification: {status}")
         click.echo(f"Digest       : {result.artifact_digest}")
         click.echo(f"Signature    : {'valid' if result.signature_valid else 'INVALID'}")
+        if result.signature_algorithm is not None:
+            click.echo(f"Algorithm    : {result.signature_algorithm}")
+            click.echo(f"Key          : {result.signer_key_fingerprint}")
         if result.signer_trusted is None:
             click.echo("Signer       : NOT CHECKED (no --trusted-fingerprint given)")
         else:
@@ -696,6 +716,7 @@ def policy_check(
     storage_root: Path | None,
     registry_dsn_env: str | None,
     trusted_fingerprints: tuple[str, ...],
+    reject_legacy_signatures: bool,
     cache_dir: Path | None,
     output_format: str,
 ) -> None:
@@ -706,7 +727,11 @@ def policy_check(
     """
     try:
         guard = _make_guard(
-            storage_root, registry_dsn_env, cache_dir=cache_dir, trusted=trusted_fingerprints
+            storage_root,
+            registry_dsn_env,
+            cache_dir=cache_dir,
+            trusted=trusted_fingerprints,
+            reject_legacy_signatures=reject_legacy_signatures,
         )
         result = guard.check_policy(path, mbom_path, signature_path, policy_file)
     except ModelGuardError as exc:
