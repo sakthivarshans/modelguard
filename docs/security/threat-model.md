@@ -161,3 +161,29 @@ Non-goals: ModelGuard does not sandbox the database or bucket, manage
 their encryption at rest, or authenticate registry *contents* (only the
 artifact signature does that).
 
+## Addendum -- Phase 7 slice 7a (signature-scheme plumbing)
+
+New trust boundary: **which cryptographic scheme verifies a given
+signature is no longer read from an unsigned field alone.** For a
+format-version-2 payload, the algorithm and the signing key's
+fingerprint are inside the signed bytes; the unsigned
+`signature_type` label is checked for agreement but never trusted on
+its own.
+
+| Threat | Mitigation | Residual risk |
+| --- | --- | --- |
+| Algorithm confusion: relabel `signature_type` to imply a different scheme was used | For v2 payloads, `signature_algorithm` is signed; the unsigned label must equal it or verification fails (`SignatureInvalidError`). For v1, the single legal label is a fixed constant, not attacker input. Tests: relabeling in both directions; mutation-checked (test fails when either check is removed). | A verifier that only ever calls `check_signature_bytes`/`verify_envelope_signature` without a trust check still only proves "some registered-scheme key produced this", same as before. |
+| Key substitution: swap the embedded public key for a different one whose signature also happens to verify | v2 payloads sign `key_id` (fingerprint of the intended key); the verifier recomputes the fingerprint from the actual key bytes and compares. Test: swap key+signature for a second valid keypair, confirm rejection quoting "key was substituted". Mutation-checked. | v1 payloads have no `key_id`; substitution there is caught only by the outer trust-fingerprint check (which was already the only defense pre-0.7.0), not by the signature itself. |
+| Downgrade: present a strong-scheme key/signature under a weaker/legacy envelope shape to dodge a stricter check | v1 requires the fixed `ed25519-local` label and enforces `ed25519` regardless of what bytes are supplied; a P-256 key/signature under that label fails on the cryptographic check itself, not on a scheme check that could be skipped. Test: `test_a_v1_shaped_signature_cannot_claim_to_be_a_stronger_scheme`. | No downgrade *within* v2 is possible (algorithm is signed); the only "downgrade" surface is choosing to accept v1 at all, which is why `allow_legacy_v1`/`--reject-legacy-signatures` exists as an explicit opt-out. |
+| Hostile signature file (oversized, deeply nested, non-UTF-8, unknown fields) consumes resources or reaches a parser bug | `load_envelope()` caps bytes read before JSON parsing, decodes strict UTF-8, and validates against a schema that rejects unknown fields at every level; failures are normalized to `MalformedSignatureError` without echoing attacker-controlled values. Tests: oversized file, deep nesting, non-UTF-8, unknown top-level and nested fields. | A parser resource-exhaustion bug in the JSON decoder itself, below the byte cap, is out of scope (stdlib `json`). |
+| Signing provider (future KMS/HSM adapter) leaks credentials or resource identifiers through exception text | `sign_with_provider()` converts any provider exception to `SigningProviderError` carrying only `type(exc).__name__`, with the original exception's `__cause__` suppressed. An adapter that wants a specific, safe message raises `SigningProviderError` itself. Test: a provider whose exception text contains a fake secret token; asserts the token never appears in the raised error and `__cause__` is `None`. | An adapter author who raises a bare, unwrapped exception with sensitive text, bypassing `SigningProviderError`, defeats this; the contract is enforced by tests on the built-in call path, not by construction. |
+| A misconfigured or compromised signing provider returns a signature that does not match its own reported public key (e.g. a KMS alias silently repointed at a different key) | `sign_with_provider()` verifies the envelope it just built, against the provider's own `public_key()`, before returning it; a mismatch raises `SigningProviderError` and no envelope is produced. Test: provider whose `sign()` uses a different key than `public_key()` reports. | Only catches the mismatch at signing time; if the alias is repointed *after* signing, that is a trust-root/rotation problem for slice 7b, not this check. |
+
+## Explicit non-goals of Phase 7 slice 7a
+
+This slice does not add a trust-configuration format, key expiry,
+per-key revocation, key rotation tooling, KMS/HSM adapters, or
+Sigstore support -- see `docs/limitations.md` and the Phase 7 plan.
+Binding `signature_algorithm`/`key_id` into the signed payload makes
+those *representable* in a future trust config; it does not itself
+change how trust is decided (still a flat fingerprint set).
