@@ -211,7 +211,8 @@ not assume it works.
   expiry, no per-key revocation (remove the fingerprint), no key
   rotation tooling, and no binding between the human-readable
   `signer_identity` string and the key: the identity is still an
-  unverified claim. Sigstore/KMS identity is a later phase. A
+  unverified claim. A structured trust-configuration file, expiry, and
+  revocation are planned for Phase 7 slice 7b (not yet built). A
   fingerprint is only as trustworthy as the channel you obtained it
   through.
 - **The digest cache trusts filesystem metadata.** A hit means "size,
@@ -328,6 +329,76 @@ See `docs/deployment/postgres.md` for setup (roles, grants, TLS).
   bucket you cannot see**: 403 raises (never "absent"), but with
   restricted permissions a missing bucket may be reported as a missing
   blob. Grant `s3:ListBucket` so S3 returns 404 for missing keys.
+
+## Phase 7 slice 7a: signature-scheme plumbing
+
+### Implemented
+
+- A signature scheme registry (`modelguard.signing.schemes`) decoupled
+  from key custody: `ed25519` (unchanged) and a new
+  `ecdsa-p256-sha256` (uncompressed SEC1 public key, DER
+  `ECDSA-Sig-Value` signature, SHA-256). The registry is an immutable
+  mapping; a caller-supplied verifier cannot replace a built-in scheme,
+  only add a new algorithm id.
+- A `SignerProvider` protocol (`modelguard.signing.providers`) so a
+  signature can come from something other than a local private key file
+  in a future slice (KMS, HSM). `LocalEd25519Signer` adapts the existing
+  local key path onto it; `ModelGuard.sign()` is unchanged and still
+  produces an Ed25519 signature by default. `ModelGuard.sign_with_provider()`
+  is the new entry point for other providers.
+- A new **format-version-2** signature payload that additionally signs
+  `signature_algorithm` and `key_id` (the fingerprint of the signing
+  key), so the algorithm and the key cannot be swapped after signing
+  without invalidating the signature. Version 1 (pre-0.7.0) payloads are
+  unchanged byte-for-byte (the new fields are omitted, not null, when
+  absent) and still verify; `ModelGuard(allow_legacy_signatures=False)`
+  / CLI `--reject-legacy-signatures` refuses them going forward.
+  `tests/fixtures/legacy_signature_0_6_0/` holds a signature produced by
+  the unmodified 0.6.0 signer, checked in as a compatibility guard.
+- `verify_envelope_signature()` is now the single authoritative
+  verification path (`check_signature_bytes` delegates to it) and
+  returns which algorithm and key fingerprint actually verified, rather
+  than the caller re-deriving the fingerprint from an unverified claim.
+  `VerificationResult.signature_algorithm` /
+  `.signer_key_fingerprint` expose this over the SDK and CLI.
+- Signature files are parsed through a single bounded loader
+  (`load_envelope`): size-capped before any JSON parsing, strict schema
+  (unknown fields rejected), and a `MalformedSignatureError` distinct
+  from `SignatureInvalidError` for anything that isn't even a
+  well-formed envelope.
+- `sign_with_provider()` re-verifies the signature it just produced,
+  against the provider's own reported public key, before returning an
+  envelope, and normalizes every provider exception to
+  `SigningProviderError` reporting only the exception type (never the
+  original message, which for a real KMS/HSM can contain credentials or
+  resource identifiers).
+
+### Not implemented / limits (be aware before relying on these)
+
+- **No trust configuration yet.** Trust is still only a flat set of
+  fingerprints (`--trusted-fingerprint`); expiry, per-key revocation,
+  scoping, and binding `signer_identity` to a key are slice 7b.
+- **No KMS or HSM adapter yet.** `SignerProvider` exists so one can be
+  added without changing verification; none ships in this slice (7c).
+- **No Sigstore adapter.** Deferred; see the Phase 7 plan.
+- **Ed25519 verification does not reject small-order public keys**
+  (delegated to OpenSSL via `cryptography`), so a *universal* signature
+  under such a key verifies for any message without any private key.
+  This has always been true of the Ed25519 path and is unchanged by
+  this slice. It is harmless only because trust roots are the actual
+  gate: no configuration should ever list such a key as trusted, and an
+  untrusted signature was never going to be `allowed` regardless. It
+  does mean `check_signature_bytes`/`verify_envelope_signature` alone
+  (without a trust check) cannot be used as a proof that *some*
+  legitimate signer produced a given signature.
+- **ECDSA P-256 signatures are not unique.** `(r, s)` and `(r, n - s)`
+  both verify for the same message and key (standard ECDSA signature
+  malleability). A signature must never be treated as an identifier;
+  ModelGuard never does this (the artifact digest is the identity), but
+  any new code must not either.
+- **`key_id` binds a key to a payload, not a key to an identity.**
+  `signer_identity` remains an unverified claim; only the key
+  fingerprint is checked against trust roots.
 - **Downloads are private (0600/0700)** and case-insensitive filesystems
   can merge paths that differ only by case; Windows is untested.
 - **Limits are defaults, not guarantees**: 256 GiB total, 100,000 files,
