@@ -23,7 +23,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from modelguard.cache import CachedHasher
-from modelguard.exceptions import ModelGuardError, TrustConfigurationError, VerificationDenied
+from modelguard.exceptions import ModelGuardError, VerificationDenied
 from modelguard.hashing.digest import ArtifactDigest, hash_artifact
 from modelguard.manifest.builder import DeclaredMetadata, build_manifest
 from modelguard.manifest.models import Manifest
@@ -45,14 +45,16 @@ from modelguard.registry.local import LocalRegistry
 from modelguard.registry.models import RegistryRecord, RevocationRecord
 from modelguard.registry.protocol import Registry
 from modelguard.scanning import ScanReport, Severity, run_scanners
-from modelguard.signing.envelope import SignatureEnvelope
+from modelguard.signing.envelope import SignatureEnvelope, load_envelope
 from modelguard.signing.keys import LocalKeyPair, load_public_key
-from modelguard.signing.signer import sign_artifact
-from modelguard.signing.trust import normalize_fingerprints, public_key_fingerprint
+from modelguard.signing.providers import SignerProvider
+from modelguard.signing.signer import sign_artifact, sign_with_provider
+from modelguard.signing.trust import normalize_fingerprints
 from modelguard.signing.verifier import (
+    SignatureCheck,
     check_artifact_digest,
     check_mbom_digest,
-    check_signature_bytes,
+    verify_envelope_signature,
 )
 
 
@@ -86,6 +88,9 @@ class VerificationResult:
     signer_trusted: bool | None = None
     revocation_checked: bool = False
     digest_from_cache: bool = False
+    # What actually verified the signature (None when it did not verify).
+    signature_algorithm: str | None = None
+    signer_key_fingerprint: str | None = None
 
     def raise_if_denied(self) -> None:
         if not self.allowed:
@@ -130,6 +135,10 @@ class ModelGuard:
     revocation check in ``verify()`` instead of the local file registry.
     Provenance and audit remain local (``storage_root``).
 
+    ``allow_legacy_signatures=False`` refuses format-version-1 signatures
+    (written by ModelGuard <= 0.6.0), which do not commit to the signing
+    key. Leave it ``True`` only while old signatures still need to verify.
+
     ``cache_dir`` opts in to the local digest cache
     (``modelguard.cache``); nothing is written to disk for caching
     unless it is set.
@@ -142,7 +151,9 @@ class ModelGuard:
         cache_dir: str | Path | None = None,
         trusted_key_fingerprints: Iterable[str] | None = None,
         registry: Registry | None = None,
+        allow_legacy_signatures: bool = True,
     ) -> None:
+        self._allow_legacy_signatures = allow_legacy_signatures
         self._storage_root = Path(storage_root) if storage_root else None
         self._injected_registry = registry
         self._hasher: CachedHasher | None = CachedHasher(Path(cache_dir)) if cache_dir else None
@@ -195,6 +206,12 @@ class ModelGuard:
     def sign(self, manifest: Manifest, mbom: MLBOM, keypair: LocalKeyPair) -> SignatureEnvelope:
         return sign_artifact(manifest, mbom, keypair)
 
+    def sign_with_provider(
+        self, manifest: Manifest, mbom: MLBOM, provider: SignerProvider
+    ) -> SignatureEnvelope:
+        """Sign with any ``SignerProvider`` (local key, KMS, HSM, ...)."""
+        return sign_with_provider(manifest, mbom, provider)
+
     def verify(
         self,
         artifact_path: str | Path,
@@ -211,15 +228,16 @@ class ModelGuard:
         """
         path = Path(artifact_path)
         mbom = MLBOM.model_validate(json.loads(Path(mbom_path).read_text()))
-        envelope = SignatureEnvelope.model_validate(
-            json.loads(Path(signature_path).read_text())
-        )
+        envelope = load_envelope(Path(signature_path))
 
         reasons: list[str] = []
 
         signature_valid = True
+        signature_check: SignatureCheck | None = None
         try:
-            check_signature_bytes(envelope)
+            signature_check = verify_envelope_signature(
+                envelope, allow_legacy_v1=self._allow_legacy_signatures
+            )
         except ModelGuardError as exc:
             signature_valid = False
             reasons.append(str(exc))
@@ -256,19 +274,18 @@ class ModelGuard:
             current_digest = envelope.payload.artifact_digest
             reasons.append(str(exc))
 
-        # Trust roots are checked against the key that actually verified
-        # the signature, and only when configured. ``None`` (not
-        # configured) is reported as such, never as trusted.
+        # Trust roots are checked against the fingerprint of the key that
+        # actually verified the signature (computed by the verifier from
+        # the key bytes, never read from a claimed field), and only when
+        # configured. ``None`` (not configured) is reported as such,
+        # never as trusted.
         signer_trusted: bool | None = None
         if self._trusted is not None:
-            try:
-                key_fingerprint = public_key_fingerprint(envelope.public_key)
-            except TrustConfigurationError:
-                key_fingerprint = ""
-            signer_trusted = signature_valid and key_fingerprint in self._trusted
-            if not signer_trusted and signature_valid:
+            verified_fingerprint = signature_check.key_fingerprint if signature_check else None
+            signer_trusted = verified_fingerprint is not None and verified_fingerprint in self._trusted
+            if not signer_trusted and verified_fingerprint is not None:
                 reasons.append(
-                    f"The signing key (fingerprint {key_fingerprint or 'unreadable'}) is not in "
+                    f"The signing key (fingerprint {verified_fingerprint}) is not in "
                     "the configured set of trusted key fingerprints."
                 )
 
@@ -306,6 +323,8 @@ class ModelGuard:
             signer_trusted=signer_trusted,
             revocation_checked=revocation_checked,
             digest_from_cache=digest_from_cache,
+            signature_algorithm=signature_check.algorithm if signature_check else None,
+            signer_key_fingerprint=signature_check.key_fingerprint if signature_check else None,
         )
 
     def load_public_key(self, path: str | Path) -> Ed25519PublicKey:
