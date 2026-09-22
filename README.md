@@ -38,6 +38,17 @@ storage on a local directory or S3-compatible bucket
 (`modelguard artifact push|pull`) where every download is
 hash-verified. Setup: `docs/deployment/postgres.md`.
 
+**Phase 7 slice 7a (signature-scheme plumbing):** a pluggable signature
+scheme registry (`ed25519`, plus a new `ecdsa-p256-sha256`) and a
+`SignerProvider` interface so a signature can come from something other
+than a local key file. A new signature format version signs the
+algorithm and the signing key's fingerprint, closing an
+algorithm-confusion/key-substitution gap; format-version-1 signatures
+(pre-0.7.0) still verify unless `--reject-legacy-signatures` /
+`allow_legacy_signatures=False` is set. Trust configuration, key
+rotation, KMS, HSM, and Sigstore are not yet built (later Phase 7
+slices) -- see `docs/limitations.md`.
+
 See `docs/limitations.md` for what is explicitly out of scope so far.
 
 ## Quick start
