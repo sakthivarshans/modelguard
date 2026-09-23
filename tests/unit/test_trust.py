@@ -56,7 +56,7 @@ def test_verify_denies_a_valid_signature_from_an_untrusted_key(signed_model: Sig
     assert result.signature_valid
     assert result.signer_trusted is False
     assert not result.allowed
-    assert any("not in the configured set of trusted key fingerprints" in r for r in result.reasons)
+    assert any("No trusted key is configured with fingerprint" in r for r in result.reasons)
 
 
 def test_attacker_resigning_with_own_key_is_denied(tmp_path_factory: pytest.TempPathFactory) -> None:
