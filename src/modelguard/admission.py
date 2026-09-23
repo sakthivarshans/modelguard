@@ -93,8 +93,8 @@ def admit(
                 reasons=(
                     (
                         "No trusted signer keys are configured. Admission requires an "
-                        "explicit trust root: construct "
-                        "ModelGuard(trusted_key_fingerprints=[...])."
+                        "explicit trust root: construct ModelGuard(trusted_key_fingerprints="
+                        "[...]) or ModelGuard(trust_config=...)."
                     ),
                 ),
                 correlation_id=correlation_id,
