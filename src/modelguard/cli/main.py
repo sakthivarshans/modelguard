@@ -38,6 +38,7 @@ from modelguard.signing.keys import (
 )
 from modelguard.signing.signer import sign_artifact
 from modelguard.signing.trust import public_key_fingerprint
+from modelguard.signing.trust_config import load_trust_config_file
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -101,6 +102,16 @@ def _trust_and_cache_options(func: _F) -> _F:
         help="SHA-256 fingerprint of a trusted signer public key (repeatable). Compute one "
         "with `modelguard fingerprint KEYFILE`. Without any, the signer is NOT checked.",
     )(func)
+    func = click.option(
+        "--trust-config",
+        "trust_config_path",
+        type=click.Path(exists=True, path_type=Path),
+        default=None,
+        help="Path to a trust configuration file (see `modelguard trust validate`). Gives each "
+        "trusted key its own status, validity window, and optional identity/scope binding. "
+        "May be combined with --trusted-fingerprint; a fingerprint configured differently by "
+        "each is an error.",
+    )(func)
     return func
 
 
@@ -146,13 +157,16 @@ def _make_guard(
     *,
     cache_dir: Path | None = None,
     trusted: tuple[str, ...] = (),
+    trust_config_path: Path | None = None,
     reject_legacy_signatures: bool = False,
 ) -> ModelGuard:
+    trust_config = load_trust_config_file(trust_config_path) if trust_config_path else None
     return ModelGuard(
         allow_legacy_signatures=not reject_legacy_signatures,
         storage_root=storage_root,
         cache_dir=cache_dir,
         trusted_key_fingerprints=trusted or None,
+        trust_config=trust_config,
         registry=_registry_from_env(registry_dsn_env),
     )
 
@@ -345,6 +359,7 @@ def verify(
     storage_root: Path | None,
     registry_dsn_env: str | None,
     trusted_fingerprints: tuple[str, ...],
+    trust_config_path: Path | None,
     reject_legacy_signatures: bool,
     cache_dir: Path | None,
     output_format: str,
@@ -362,6 +377,7 @@ def verify(
             registry_dsn_env,
             cache_dir=cache_dir,
             trusted=trusted_fingerprints,
+            trust_config_path=trust_config_path,
             reject_legacy_signatures=reject_legacy_signatures,
         )
         result = guard.verify(path, mbom_path, signature_path)
@@ -687,6 +703,63 @@ def policy_validate(policy_path: Path) -> None:
     click.echo(f"Enabled rules: {', '.join(enabled) if enabled else '(none)'}")
 
 
+@cli.group()
+def trust() -> None:
+    """Load and validate trust configuration documents."""
+
+
+@trust.command("validate")
+@click.argument("trust_config_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def trust_validate(trust_config_path: Path, output_format: str) -> None:
+    """Validate a trust configuration file's schema without evaluating it.
+
+    Does not check whether any key is currently active, expired, or
+    revoked (that depends on the clock at verification time) --
+    this only confirms the file parses and every entry is well-formed.
+    """
+    try:
+        config = load_trust_config_file(trust_config_path)
+    except ModelGuardError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(EXIT_ERROR)
+
+    counts: dict[str, int] = {}
+    for key in config.keys:
+        counts[key.status.value] = counts.get(key.status.value, 0) + 1
+
+    if output_format == "json":
+        payload = {
+            "version": config.version,
+            "key_count": len(config.keys),
+            "status_counts": counts,
+            "keys": [
+                {
+                    "key_id": key.key_id,
+                    "algorithm": key.algorithm,
+                    "status": key.status.value,
+                    "not_before": key.not_before.isoformat() if key.not_before else None,
+                    "not_after": key.not_after.isoformat() if key.not_after else None,
+                    "signer_identity": key.signer_identity,
+                    "scope_model_id_patterns": list(key.scope_model_id_patterns),
+                    "label": key.label,
+                }
+                for key in config.keys
+            ],
+        }
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(f"Trust configuration is valid (schema version {config.version}).")
+        click.echo(f"Keys: {len(config.keys)}")
+        for status, count in sorted(counts.items()):
+            click.echo(f"  {status}: {count}")
+        for key in config.keys:
+            scoped = f", scoped to {list(key.scope_model_id_patterns)}" if key.scope_model_id_patterns else ""
+            identity = f", identity={key.signer_identity!r}" if key.signer_identity else ""
+            label = f" ({key.label})" if key.label else ""
+            click.echo(f"  {key.key_id} [{key.status.value}]{identity}{scoped}{label}")
+
+
 @policy.command("check")
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("--mbom", "mbom_path", type=click.Path(exists=True, path_type=Path), required=True)
@@ -716,6 +789,7 @@ def policy_check(
     storage_root: Path | None,
     registry_dsn_env: str | None,
     trusted_fingerprints: tuple[str, ...],
+    trust_config_path: Path | None,
     reject_legacy_signatures: bool,
     cache_dir: Path | None,
     output_format: str,
@@ -731,6 +805,7 @@ def policy_check(
             registry_dsn_env,
             cache_dir=cache_dir,
             trusted=trusted_fingerprints,
+            trust_config_path=trust_config_path,
             reject_legacy_signatures=reject_legacy_signatures,
         )
         result = guard.check_policy(path, mbom_path, signature_path, policy_file)
