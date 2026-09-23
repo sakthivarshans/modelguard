@@ -133,3 +133,29 @@ def test_audit_records_contain_no_key_material(signed_model: SignedModel, tmp_pa
     private_hex = signed_model.keypair.private_key.private_bytes_raw().hex()
     assert private_hex not in text
     assert json.loads(text.splitlines()[0])["record"]["event_type"] == "deployment.admission"
+
+
+def test_admits_via_trust_config_alone(signed_model: SignedModel) -> None:
+    """admit()'s trust-root gate reads guard.trusted_key_fingerprints, which
+    must still be populated (and admission must still succeed) when trust
+    was configured only via trust_config, not trusted_key_fingerprints."""
+    from modelguard.signing.trust_config import TrustConfig, TrustedKeyEntry
+
+    guard = ModelGuard(
+        trust_config=TrustConfig(keys=(TrustedKeyEntry(key_id=signed_model.fingerprint),))
+    )
+    decision = _admit(signed_model, guard)
+    assert decision.admitted is True
+
+
+def test_refuses_via_trust_config_revoked_key(signed_model: SignedModel) -> None:
+    from modelguard.signing.trust_config import TrustConfig, TrustedKeyEntry
+
+    guard = ModelGuard(
+        trust_config=TrustConfig(
+            keys=(TrustedKeyEntry(key_id=signed_model.fingerprint, status="revoked"),)  # type: ignore[arg-type]
+        )
+    )
+    decision = _admit(signed_model, guard)
+    assert decision.admitted is False
+    assert any("not signed by a trusted key" in r for r in decision.reasons)
