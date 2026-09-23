@@ -49,7 +49,12 @@ from modelguard.signing.envelope import SignatureEnvelope, load_envelope
 from modelguard.signing.keys import LocalKeyPair, load_public_key
 from modelguard.signing.providers import SignerProvider
 from modelguard.signing.signer import sign_artifact, sign_with_provider
-from modelguard.signing.trust import normalize_fingerprints
+from modelguard.signing.trust_config import (
+    TrustConfig,
+    build_minimal_trust_config,
+    evaluate_trust,
+    merge_trust_configs,
+)
 from modelguard.signing.verifier import (
     SignatureCheck,
     check_artifact_digest,
@@ -123,11 +128,22 @@ class ModelGuard:
     clear error explains what to configure.
 
     ``trusted_key_fingerprints`` are the SHA-256 fingerprints of the
-    public keys whose signatures the caller accepts (see
-    ``modelguard.signing.trust``). Leave it ``None`` and no signer is
-    considered trusted; ``verify()`` still works but reports
-    ``signer_trusted=None``. An empty collection raises
-    ``TrustConfigurationError``.
+    public keys whose signatures the caller accepts -- unconstrained,
+    always-active trust (see ``modelguard.signing.trust``). Leave it
+    ``None`` and no signer is considered trusted; ``verify()`` still
+    works but reports ``signer_trusted=None``. An empty collection
+    raises ``TrustConfigurationError``.
+
+    ``trust_config`` is a full ``modelguard.signing.trust_config.TrustConfig``
+    (build one with ``load_trust_config_file()``), giving each key its
+    own status (active/retired/revoked), validity window, optional
+    binding to a claimed signer identity, and optional scoping to
+    model_id patterns -- see ``modelguard.signing.trust_config`` for the
+    security rationale (expiry/revocation are checked against the
+    verifier's clock, never the signature's claimed signing time).
+    ``trusted_key_fingerprints`` and ``trust_config`` may be combined; a
+    fingerprint configured differently by each raises
+    ``TrustConfigurationError`` rather than silently picking one.
 
     ``registry`` injects any object implementing the ``Registry``
     protocol (e.g. ``modelguard.registry.postgres.PostgresRegistry``).
@@ -150,6 +166,7 @@ class ModelGuard:
         *,
         cache_dir: str | Path | None = None,
         trusted_key_fingerprints: Iterable[str] | None = None,
+        trust_config: TrustConfig | None = None,
         registry: Registry | None = None,
         allow_legacy_signatures: bool = True,
     ) -> None:
@@ -157,15 +174,30 @@ class ModelGuard:
         self._storage_root = Path(storage_root) if storage_root else None
         self._injected_registry = registry
         self._hasher: CachedHasher | None = CachedHasher(Path(cache_dir)) if cache_dir else None
-        self._trusted: frozenset[str] | None = (
-            normalize_fingerprints(trusted_key_fingerprints)
-            if trusted_key_fingerprints is not None
-            else None
-        )
+        configs = []
+        if trusted_key_fingerprints is not None:
+            configs.append(build_minimal_trust_config(trusted_key_fingerprints))
+        if trust_config is not None:
+            configs.append(trust_config)
+        self._trust: TrustConfig | None = merge_trust_configs(*configs) if configs else None
+
+    @property
+    def trust_config(self) -> TrustConfig | None:
+        """The effective, merged trust configuration, or ``None`` if none was configured."""
+        return self._trust
 
     @property
     def trusted_key_fingerprints(self) -> frozenset[str] | None:
-        return self._trusted
+        """The fingerprints covered by the effective trust configuration.
+
+        Kept for backward compatibility with Phase 5 callers. Note this
+        reports which fingerprints are *configured*, not which are
+        currently active -- a retired or revoked key's fingerprint
+        still appears here. Use ``trust_config`` for the full picture.
+        """
+        if self._trust is None:
+            return None
+        return frozenset(key.key_id for key in self._trust.keys)
 
     @property
     def registry(self) -> Registry:
@@ -274,20 +306,31 @@ class ModelGuard:
             current_digest = envelope.payload.artifact_digest
             reasons.append(str(exc))
 
-        # Trust roots are checked against the fingerprint of the key that
+        # Trust is evaluated against the fingerprint and algorithm that
         # actually verified the signature (computed by the verifier from
         # the key bytes, never read from a claimed field), and only when
-        # configured. ``None`` (not configured) is reported as such,
-        # never as trusted.
+        # a trust configuration is set. ``None`` (not configured) is
+        # reported as such, never as trusted. See
+        # modelguard.signing.trust_config for why this is checked
+        # against wall-clock time, never the payload's claimed
+        # signed_at.
         signer_trusted: bool | None = None
-        if self._trusted is not None:
-            verified_fingerprint = signature_check.key_fingerprint if signature_check else None
-            signer_trusted = verified_fingerprint is not None and verified_fingerprint in self._trusted
-            if not signer_trusted and verified_fingerprint is not None:
-                reasons.append(
-                    f"The signing key (fingerprint {verified_fingerprint}) is not in "
-                    "the configured set of trusted key fingerprints."
+        if self._trust is not None:
+            if signature_check is None:
+                # The signature itself did not verify; there is no key to
+                # evaluate trust for. Keep this distinct from "not configured".
+                signer_trusted = False
+            else:
+                evaluation = evaluate_trust(
+                    signature_check.key_fingerprint,
+                    signature_check.algorithm,
+                    self._trust,
+                    claimed_signer_identity=envelope.payload.signer_identity,
+                    model_id=envelope.payload.model_id,
                 )
+                signer_trusted = evaluation.trusted
+                if not signer_trusted:
+                    reasons.extend(evaluation.reasons)
 
         allowed = signature_valid and mbom_valid and digest_matches and signer_trusted is not False
 
