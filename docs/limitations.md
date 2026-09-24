@@ -375,9 +375,10 @@ See `docs/deployment/postgres.md` for setup (roles, grants, TLS).
 
 ### Not implemented / limits (be aware before relying on these)
 
-- **No trust configuration yet.** Trust is still only a flat set of
-  fingerprints (`--trusted-fingerprint`); expiry, per-key revocation,
-  scoping, and binding `signer_identity` to a key are slice 7b.
+- **Trust configuration now exists (slice 7b) but is still basic.**
+  See the Phase 7 slice 7b section below for what it covers and what it
+  doesn't (no key rotation tooling, no signed trust config, no
+  transparency log).
 - **No KMS or HSM adapter yet.** `SignerProvider` exists so one can be
   added without changing verification; none ships in this slice (7c).
 - **No Sigstore adapter.** Deferred; see the Phase 7 plan.
@@ -407,3 +408,74 @@ See `docs/deployment/postgres.md` for setup (roles, grants, TLS).
   implementing the S3 API), not against AWS or MinIO; PostgreSQL tests
   run against a real PostgreSQL 16 but only when
   `MODELGUARD_TEST_POSTGRES_DSN` is set (otherwise visibly skipped).
+
+## Phase 7 slice 7b: trust configuration
+
+### Implemented
+
+- `modelguard.signing.trust_config.TrustConfig`: a strict-schema
+  (`extra="forbid"` throughout), safe-YAML-loaded (`load_trust_config_file`,
+  size-capped) set of trusted keys. Each `TrustedKeyEntry` has:
+  - `key_id` (the fingerprint, same value `verify_envelope_signature`
+    returns), optionally `algorithm` (pinning the entry to one scheme),
+  - `status`: `active` / `retired` / `revoked`,
+  - `not_before` / `not_after` (must carry an explicit UTC offset;
+    naive timestamps are rejected),
+  - `signer_identity` (optional binding to the *claimed* identity in
+    the payload -- still not itself verified, only compared),
+  - `scope_model_id_patterns` (optional `fnmatch`-style, case-sensitive
+    restriction to specific `model_id`s),
+  - `label` (free-text, for humans).
+  A fingerprint may appear at most once (a rotation overlap is two
+  different keys, not two entries for one key).
+- `evaluate_trust()` decides trust from the algorithm/fingerprint that
+  *actually verified* the signature (never an unverified claim) and
+  the **verifier's own clock**, not the signature's claimed `signed_at`
+  -- see the module docstring for why that specific design choice
+  matters (an attacker who controls the signing key also controls what
+  timestamp a forged signature claims, so expiry/revocation checked
+  against that timestamp would be checking attacker-controlled input).
+  A practical consequence: revoking a key is effective for every
+  verification from that moment on, regardless of what signing time
+  any signature -- forged or genuine -- claims.
+- `ModelGuard(trust_config=...)`, combinable with
+  `trusted_key_fingerprints` (`build_minimal_trust_config` /
+  `merge_trust_configs`); a fingerprint configured two different ways
+  across the two sources raises `TrustConfigurationError` rather than
+  silently picking one. `ModelGuard.trust_config` exposes the merged
+  result; `ModelGuard.trusted_key_fingerprints` keeps working
+  (reporting configured, not necessarily currently-active,
+  fingerprints) so existing callers and `admission.admit()`'s
+  trust-configured check are unaffected.
+- CLI: `--trust-config PATH` on `verify` and `policy check`;
+  `modelguard trust validate PATH` (schema-only; does not evaluate
+  expiry/revocation, since that depends on the clock at verification
+  time, not at validation time).
+
+### Not implemented / limits (be aware before relying on these)
+
+- **The trust configuration file itself is not signed or otherwise
+  tamper-evident.** Anyone who can write the path passed via
+  `--trust-config` can add their own key -- this is the same posture as
+  Phase 3's policy files (see "Policy Bypass" in the threat model): the
+  mitigation is deployment-level access control on the file, not
+  anything this module does. A signed trust configuration is future
+  work.
+- **No key rotation *tooling*.** The format can represent a rotation
+  (old key `retired` or with `not_after` set, new key `active`), but
+  there is no CLI workflow to generate one; you edit the file. Slice 7c
+  is where a rotation *workflow* is planned.
+- **No revocation transparency / append-only log for trust config
+  changes.** Unlike registry revocation (Phase 6, database-enforced
+  append-only), editing a trust config file is a plain overwrite with
+  no history. Combine with version control on the file if an audit
+  trail of trust changes matters.
+- **`scope_model_id_patterns` matches `model_id` only**, not `version`;
+  a key scoped to a model_id is trusted for every version of it.
+- **No wildcard/negative fingerprints** (e.g. "trust everything except
+  X"); every trusted key must be listed explicitly.
+- **`signer_identity` binding is still just a string comparison**
+  against an unverified claim (see the 7a limitation on `key_id`);
+  binding a key to an identity narrows *which claimed identity* that
+  key's signature must carry to be trusted, but does not mean the
+  identity itself was authenticated by anything.
