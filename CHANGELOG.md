@@ -4,6 +4,86 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.8.0] - Phase 7 slice 7b: trust configuration
+
+### Added
+
+- **`modelguard.signing.trust_config.TrustConfig`**: a strict-schema,
+  safe-YAML-loaded set of trusted keys, replacing the flat fingerprint
+  set with per-key `status` (active/retired/revoked), `not_before`/
+  `not_after` (timezone-required), optional `algorithm` pinning,
+  optional `signer_identity` binding, and optional
+  `scope_model_id_patterns`. A fingerprint may appear at most once.
+- **`evaluate_trust()`**: decides trust from what actually verified a
+  signature (fingerprint and algorithm from `SignatureCheck`) against
+  the trust configuration and the **verifier's own clock**. Deliberately
+  takes no signature-timestamp parameter, so expiry and revocation
+  cannot be influenced by a signature's claimed (attacker-controlled)
+  `signed_at`.
+- **`load_trust_config_file()`**: size-capped, `yaml.safe_load`-only
+  loader with the same "malformed input fails as one exception type"
+  discipline as the policy and envelope loaders.
+- **`build_minimal_trust_config()`** / **`merge_trust_configs()`**: turn
+  a flat fingerprint list into an unconstrained `TrustConfig`
+  (backward-compatible with `--trusted-fingerprint`), and combine
+  multiple sources, rejecting genuinely conflicting duplicate entries
+  rather than silently picking one.
+- SDK: `ModelGuard(trust_config=...)`, combinable with
+  `trusted_key_fingerprints`; new `ModelGuard.trust_config` property.
+- CLI: `--trust-config PATH` on `verify` and `policy check`;
+  `modelguard trust validate PATH` (with `--format json`).
+
+### Backward compatibility
+
+- `--trusted-fingerprint` / `trusted_key_fingerprints=` are unchanged
+  and now implemented as an unconstrained `TrustConfig` under the hood.
+  `ModelGuard.trusted_key_fingerprints` keeps returning a
+  `frozenset[str] | None` as before.
+- `admission.admit()`'s trust-root gate (`guard.trusted_key_fingerprints
+  is None`) is unaffected: it is populated whether trust came from
+  `trusted_key_fingerprints`, `trust_config`, or both.
+
+### Security
+
+- Closes the gap where trust was all-or-nothing per key forever: a key
+  can now be time-bounded, retired, or revoked, and revocation is
+  effective for every verification from that moment on regardless of
+  what signing time any signature -- forged or genuine -- claims (see
+  the addendum in `docs/security/threat-model.md` for the specific
+  backdating threat this defends against and what it still cannot
+  prove without a trusted timestamp or transparency log).
+- The trust configuration file joins policy files as an asset in the
+  threat model's "Policy Bypass" category: this release makes the
+  file's *parsing and evaluation* safe, not its *access control* --
+  who can write the path passed to `--trust-config` remains a
+  deployment concern, unchanged from how policy files are already
+  treated.
+
+### Testing
+
+- 79 new tests (unit + security): schema validation for every field
+  (fingerprint format, algorithm identifier format, timezone-required
+  timestamps, bounded/control-character-free strings, duplicate
+  rejection), `evaluate_trust()` for every condition alone and in
+  combination, hostile-file tests (unsafe YAML tags, oversized file,
+  non-UTF-8, YAML anchor expansion, partial-validity file rejection),
+  SDK integration (`ModelGuard.verify()` for trust/expiry/revocation/
+  scope/identity-binding, combined fingerprint+config sources,
+  conflict detection), CLI (`trust validate`, `--trust-config` on
+  `verify`/`policy check`), and `admission.admit()` with a
+  `trust_config`-only guard.
+- Eight of the riskiest checks (status-active gate, algorithm pin,
+  duplicate-key rejection, merge-conflict detection, `not_before`/
+  `not_after` gates, signer-identity binding, scope matching) were
+  mutation-checked: each was deliberately removed, confirmed to make
+  its guarding test fail, then restored. All eight caught. (One earlier
+  mutation run produced a false "not caught" result due to a stale
+  compiled-bytecode artifact from rapid sequential edits within the
+  same filesystem timestamp granularity; re-run with bytecode caching
+  disabled and a fresh interpreter per check, all eight were correctly
+  caught. Noted here per the project's test-honesty requirement to
+  report anomalies rather than quietly rerun until green.)
+
 ## [0.7.0] - Phase 7 slice 7a: signature-scheme plumbing
 
 ### Added
