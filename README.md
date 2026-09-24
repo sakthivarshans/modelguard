@@ -45,9 +45,20 @@ than a local key file. A new signature format version signs the
 algorithm and the signing key's fingerprint, closing an
 algorithm-confusion/key-substitution gap; format-version-1 signatures
 (pre-0.7.0) still verify unless `--reject-legacy-signatures` /
-`allow_legacy_signatures=False` is set. Trust configuration, key
-rotation, KMS, HSM, and Sigstore are not yet built (later Phase 7
-slices) -- see `docs/limitations.md`.
+`allow_legacy_signatures=False` is set.
+
+**Phase 7 slice 7b (trust configuration):** a structured trust
+configuration file (`--trust-config`, `modelguard trust validate`)
+replacing the flat fingerprint list with per-key status
+(active/retired/revoked), a validity window, optional binding to a
+claimed signer identity, and optional scoping to specific model_ids.
+Expiry and revocation are evaluated against the verifier's own clock,
+never a signature's claimed signing time -- see
+`docs/security/threat-model.md` for why. `--trusted-fingerprint`
+remains fully supported and composes with `--trust-config`.
+
+Key rotation tooling, KMS, HSM, and Sigstore are not yet built (later
+Phase 7 slices) -- see `docs/limitations.md`.
 
 See `docs/limitations.md` for what is explicitly out of scope so far.
 
