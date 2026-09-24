@@ -187,3 +187,32 @@ Sigstore support -- see `docs/limitations.md` and the Phase 7 plan.
 Binding `signature_algorithm`/`key_id` into the signed payload makes
 those *representable* in a future trust config; it does not itself
 change how trust is decided (still a flat fingerprint set).
+
+## Addendum -- Phase 7 slice 7b (trust configuration)
+
+New asset: the trust configuration file (`--trust-config`), which now
+sits alongside policy files in the threat model's "Policy Bypass"
+category -- an attacker who can write it can add their own key as
+trusted, which is a full bypass of everything downstream. **This
+slice's mitigations are entirely about making the file's *own* parsing
+and evaluation safe (safe YAML, strict schema, a well-defined
+evaluation), not about protecting the file from being overwritten** --
+that remains a deployment-level access-control question, unchanged
+from how policy files are already treated.
+
+| Threat | Mitigation | Residual risk |
+| --- | --- | --- |
+| A crafted trust config file executes code or constructs arbitrary Python objects during loading | `yaml.safe_load` only (never `yaml.load`); tested against a `!!python/object/apply` tag, which fails to validate rather than executing anything. | None identified for the YAML layer itself; a vulnerability in PyYAML's safe loader is out of scope. |
+| A crafted trust config file causes excessive resource use (YAML anchor/alias expansion, oversized file) | Byte-size cap (`MAX_TRUST_CONFIG_BYTES`) enforced before any YAML parsing; tested with an anchor-expansion file that exceeds the cap. | A YAML anchor bomb *smaller* than the byte cap but that still expands to something expensive during parsing is not separately defended; the cap is on serialized size, not expanded size. Keep the cap conservative. |
+| A trust config entry is malformed (bad fingerprint, naive timestamp, unknown field) and gets silently dropped while the rest of the file is still trusted | `extra="forbid"` at every level plus per-field validators; one bad entry fails the *whole file* (`TrustConfig.model_validate` is all-or-nothing), never a partial, silently-smaller trusted set. Tested: one valid + one malformed entry in the same file is refused entirely. | None identified; this is a straightforward consequence of pydantic validating the whole document atomically. |
+| Backdating: a forged or stolen-key signature claims a `signed_at` before a key's `not_after` or before it was marked revoked, hoping to be accepted as "signed while the key was still good" | `evaluate_trust()` takes no `signed_at`/payload-timestamp input at all -- structurally, there is nothing in the function signature it *could* consult -- and checks status/expiry only against `now` (the verifier's own clock, defaulting to `datetime.now(UTC)`). Test: a revoked key is refused when evaluated both "now" and against an artificially early clock value, proving the claimed signing time plays no role. | ModelGuard has no trusted timestamping or transparency log (Sigstore/Rekor-style), so it also cannot *prove* a genuine signature was made before a key's expiry -- it can only refuse to trust the key now. This is a known, explicit non-goal for this slice; see the Sigstore discussion in the Phase 7 plan. |
+| A trust entry's algorithm pin is bypassed by presenting a signature that verified under a different scheme than the entry expects | `evaluate_trust()` compares the *verified* algorithm (from `SignatureCheck`, i.e. what `verify_envelope_signature` actually used) against `TrustedKeyEntry.algorithm` when the latter is set; mutation-checked (removing the comparison makes the guarding test fail). | An entry that leaves `algorithm` unset (the default, and what `--trusted-fingerprint` produces) accepts any scheme for that fingerprint -- this is intentional backward compatibility, not a gap, but it does mean pinning the algorithm is the caller's choice to make, not the default. |
+| Duplicate or conflicting trust entries for one fingerprint create ambiguity about which constraints apply | `TrustConfig` rejects two entries with the same `key_id` at parse time (mutation-checked); `merge_trust_configs()` rejects combining two *different* sources (e.g. `--trusted-fingerprint` plus a file) that disagree about the same fingerprint's settings, accepting only exact duplicates. | None identified; the design deliberately has no "last write wins" merge semantics anywhere. |
+
+## Explicit non-goals of Phase 7 slice 7b
+
+No signed trust configuration, no key-rotation workflow/tooling, no
+revocation transparency log for the trust config itself, no wildcard
+or negative (deny-list) fingerprint rules, and no verification that a
+`signer_identity` binding corresponds to any real-world identity --
+see `docs/limitations.md`.
