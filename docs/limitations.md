@@ -479,3 +479,77 @@ See `docs/deployment/postgres.md` for setup (roles, grants, TLS).
   binding a key to an identity narrows *which claimed identity* that
   key's signature must carry to be trusted, but does not mean the
   identity itself was authenticated by anything.
+
+## Phase 7 slice 7c: key management (KMS, HSM, rotation CLI)
+
+### Implemented
+
+- **`modelguard.signing.kms.KmsSignerProvider`**: a `SignerProvider`
+  backed by AWS KMS. Supports `ECC_NIST_P256` keys (`ecdsa-p256-sha256`
+  only -- KMS does not offer Ed25519 asymmetric keys). Always uses
+  `MessageType="RAW"`: `MessageType="DIGEST"` was tested empirically
+  against the `moto` KMS emulator and produced signatures that did not
+  verify against either the raw message or its digest under
+  `cryptography`, despite KMS's own `Verify` reporting them valid, so
+  `RAW` mode (confirmed to round-trip correctly) is used exclusively.
+  Requires the `kms` extra (`pip install "modelguard[kms]"`); the core
+  package does not import this module.
+- **`modelguard.signing.hsm.Pkcs11SignerProvider`**: a `SignerProvider`
+  backed by any PKCS#11 token (a real HSM, or SoftHSM2 for testing --
+  this project's tests run against a real SoftHSM2 token, not a fake).
+  Supports EC P-256 keys. Hashes on the host (SHA-256) before calling
+  the token's `Mechanism.ECDSA`, since most PKCS#11 tokens (SoftHSM2
+  included) do not expose a combined hash-and-sign mechanism; converts
+  PKCS#11's raw `r || s` signature and `CKA_EC_POINT`-wrapped public
+  key to the DER / uncompressed-point wire format
+  `ecdsa-p256-sha256` expects. Requires the `hsm` extra
+  (`pip install "modelguard[hsm]"`, `python-pkcs11` + `asn1crypto`).
+- Both providers raise `SigningProviderError` for every failure mode
+  (wrong key type, missing key, wrong PIN, oversized message, network
+  error), with only the exception type name, whether called directly
+  or through `sign_with_provider`.
+- Trust configuration rotation CLI: `modelguard trust add-key`,
+  `retire-key`, `revoke-key`, `remove-key` -- mutate a trust
+  configuration file in place with the same schema validation as
+  loading one (a malformed `--not-after`, a duplicate fingerprint, or a
+  nonexistent fingerprint to retire/revoke/remove all fail cleanly with
+  no partial write), using an atomic write
+  (`save_trust_config_file`, write-to-temp-then-rename).
+
+### Not implemented / limits (be aware before relying on these)
+
+- **No CLI wiring for provider-based signing itself.** `modelguard sign`
+  still only signs with a local Ed25519 key; `KmsSignerProvider` and
+  `Pkcs11SignerProvider` are SDK-level (`guard.sign_with_provider(...)`)
+  only in this slice. A `modelguard sign --kms-key-id ...` /
+  `--hsm-key-label ...` CLI surface is future work.
+- **KMS: no key rotation tooling** (aliasing, automatic rotation) --
+  this adapter signs with whatever key ID/ARN/alias it is given; AWS's
+  own key rotation features are orthogonal to this integration.
+- **KMS: `moto`'s test double does not enforce a disabled key's Sign
+  being refused** (confirmed empirically: `kms.sign()` on a disabled
+  key succeeds against `moto`, where real AWS KMS would raise
+  `DisabledException`). This is a gap in the test double, not in the
+  adapter -- `KmsSignerProvider` has no local disabled-key check of its
+  own because KMS itself is meant to be the authority on that, and a
+  real KMS call does enforce it. It means this project's test suite
+  cannot demonstrate that specific failure mode end-to-end against a
+  real-shaped API; it is not a claim that the behavior is untested in
+  the sense that matters (permission/validation errors, which `moto`
+  *does* enforce correctly, are tested for real).
+- **HSM: no key generation CLI**, only the SDK helper
+  `modelguard.signing.hsm.generate_ec_keypair(session, label, key_id)`,
+  which takes a caller-provided read-write PKCS#11 session (bootstrap/
+  provisioning tooling, not part of `SignerProvider`).
+- **HSM: tested only against SoftHSM2**, not a hardware HSM. SoftHSM2 is
+  a real, standards-compliant PKCS#11 implementation, not a fake of
+  this project's own code, but a hardware HSM's timing, concurrency
+  behavior, and vendor-specific quirks are untested.
+- **Trust rotation CLI has no "generate a new key and add it" combined
+  command.** `add-key` only registers a fingerprint you already have
+  (from `modelguard fingerprint`, `KmsSignerProvider(...).public_key()`,
+  or a PKCS#11 tool); it does not generate keys itself.
+- **No file locking on trust config mutation.** Two concurrent
+  `trust add-key` invocations against the same file is a plain
+  read-modify-write race; the atomic write prevents a corrupted file
+  but not a lost update. Single-operator/CI use is assumed.
