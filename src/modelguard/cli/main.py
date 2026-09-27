@@ -18,8 +18,9 @@ from typing import Any, TypeVar
 
 import click
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from pydantic import ValidationError
 
-from modelguard.exceptions import ModelGuardError
+from modelguard.exceptions import ModelGuardError, TrustConfigurationError
 from modelguard.hashing.digest import hash_artifact
 from modelguard.manifest.builder import DeclaredMetadata, build_manifest
 from modelguard.manifest.models import Manifest
@@ -38,7 +39,12 @@ from modelguard.signing.keys import (
 )
 from modelguard.signing.signer import sign_artifact
 from modelguard.signing.trust import public_key_fingerprint
-from modelguard.signing.trust_config import load_trust_config_file
+from modelguard.signing.trust_config import (
+    TrustConfig,
+    TrustedKeyEntry,
+    load_trust_config_file,
+    save_trust_config_file,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -758,6 +764,213 @@ def trust_validate(trust_config_path: Path, output_format: str) -> None:
             identity = f", identity={key.signer_identity!r}" if key.signer_identity else ""
             label = f" ({key.label})" if key.label else ""
             click.echo(f"  {key.key_id} [{key.status.value}]{identity}{scoped}{label}")
+
+
+def _load_or_init_trust_config(path: Path) -> TrustConfig:
+    """Load an existing trust config, or start a fresh empty one if the
+    path doesn't exist yet -- so `trust add-key` can bootstrap a new
+    file, matching how `modelguard keygen` creates its output directory."""
+    if path.exists():
+        return load_trust_config_file(path)
+    return TrustConfig()
+
+
+def _normalize(key_id: str) -> str:
+    return key_id.strip().lower().removeprefix("sha256:")
+
+
+def _updated_entry(current: TrustedKeyEntry, **overrides: object) -> TrustedKeyEntry:
+    """Apply field overrides to a copy of ``current`` with FULL re-validation.
+
+    Deliberately not ``current.model_copy(update=...)``: that assigns
+    directly into ``__dict__`` and skips validation entirely, so a raw
+    CLI string passed as ``not_after`` would be stored un-parsed instead
+    of becoming a real ``datetime`` -- silently defeating the naive-
+    timestamp rejection and every other field check. Round-tripping
+    through ``model_dump(mode="json")`` + ``model_validate`` runs every
+    validator again, exactly as if the whole entry were freshly parsed
+    from a file.
+    """
+    base = current.model_dump(mode="json", exclude_none=True)
+    for key, value in overrides.items():
+        if value is None:
+            base.pop(key, None)
+        else:
+            base[key] = value
+    return TrustedKeyEntry.model_validate(base)
+
+
+def _replace_key(config: TrustConfig, key_id: str, updated: TrustedKeyEntry | None) -> TrustConfig:
+    """Return a new TrustConfig with the entry for ``key_id`` replaced by
+    ``updated`` (or removed, if ``updated`` is None). Raises
+    TrustConfigurationError if ``key_id`` is not present."""
+    normalized = _normalize(key_id)
+    remaining = [key for key in config.keys if key.key_id != normalized]
+    if len(remaining) == len(config.keys):
+        raise TrustConfigurationError(
+            f"No entry with fingerprint {normalized} exists in this trust configuration."
+        )
+    if updated is not None:
+        remaining.append(updated)
+    return TrustConfig.model_validate(
+        {"version": config.version, "keys": [k.model_dump(mode="json") for k in remaining]}
+    )
+
+
+def _render_error(exc: ModelGuardError | ValidationError) -> str:
+    """Render either a ModelGuardError or a raw pydantic ValidationError
+    (from constructing a TrustedKeyEntry/TrustConfig straight from CLI
+    input) the same way load_trust_config_file's own errors read --
+    field path and message, never a bare traceback."""
+    if isinstance(exc, ValidationError):
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['msg']}"
+            for err in exc.errors(include_input=False)[:8]
+        )
+        return f"invalid trust configuration ({problems})"
+    return str(exc)
+
+
+@trust.command("add-key")
+@click.argument("trust_config_path", type=click.Path(path_type=Path))
+@click.option("--key-id", required=True, help="SHA-256 fingerprint of the key to trust.")
+@click.option("--algorithm", default=None, help="Pin this entry to one signature scheme.")
+@click.option(
+    "--status",
+    type=click.Choice(["active", "retired", "revoked"]),
+    default="active",
+)
+@click.option("--not-before", default=None, help="ISO-8601 timestamp with UTC offset.")
+@click.option("--not-after", default=None, help="ISO-8601 timestamp with UTC offset.")
+@click.option("--signer-identity", default=None, help="Bind this key to a claimed signer identity.")
+@click.option(
+    "--scope", "scope_patterns", multiple=True, help="model_id glob pattern (repeatable)."
+)
+@click.option("--label", default=None, help="Free-text label for this key.")
+def trust_add_key(
+    trust_config_path: Path,
+    key_id: str,
+    algorithm: str | None,
+    status: str,
+    not_before: str | None,
+    not_after: str | None,
+    signer_identity: str | None,
+    scope_patterns: tuple[str, ...],
+    label: str | None,
+) -> None:
+    """Add a trusted key to a trust configuration file, creating it if needed.
+
+    Fails if a key with this fingerprint already exists (use
+    `trust retire-key` / `trust revoke-key` to change an existing
+    entry's status, not this command).
+    """
+    try:
+        config = _load_or_init_trust_config(trust_config_path)
+        entry = TrustedKeyEntry.model_validate(
+            {
+                "key_id": key_id,
+                "algorithm": algorithm,
+                "status": status,
+                "not_before": not_before,
+                "not_after": not_after,
+                "signer_identity": signer_identity,
+                "scope_model_id_patterns": list(scope_patterns),
+                "label": label,
+            }
+        )
+        updated = TrustConfig.model_validate(
+            {
+                "version": config.version,
+                "keys": [k.model_dump(mode="json") for k in config.keys]
+                + [entry.model_dump(mode="json")],
+            }
+        )
+        save_trust_config_file(updated, trust_config_path)
+    except (ModelGuardError, ValidationError) as exc:
+        click.echo(f"Error: {_render_error(exc)}", err=True)
+        sys.exit(EXIT_ERROR)
+    click.echo(f"Added {entry.key_id} [{entry.status.value}] to {trust_config_path}.")
+
+
+@trust.command("retire-key")
+@click.argument("trust_config_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--key-id", required=True, help="SHA-256 fingerprint of the key to retire.")
+@click.option(
+    "--not-after",
+    default=None,
+    help="Also set an expiry (ISO-8601 with UTC offset) instead of leaving it open-ended.",
+)
+def trust_retire_key(trust_config_path: Path, key_id: str, not_after: str | None) -> None:
+    """Mark a key 'retired': still a recognized entry, no longer trusted.
+
+    Use this for a planned rotation overlap -- retire the old key once
+    the new one is active and everything has had time to switch over.
+    Retiring (unlike removing) keeps the key's history in the file.
+    """
+    try:
+        config = load_trust_config_file(trust_config_path)
+        current = next(key for key in config.keys if key.key_id == _normalize(key_id))
+        updated_entry = _updated_entry(
+            current, status="retired", not_after=not_after or current.not_after
+        )
+        updated = _replace_key(config, key_id, updated_entry)
+        save_trust_config_file(updated, trust_config_path)
+    except StopIteration:
+        click.echo(f"Error: No entry with fingerprint {_normalize(key_id)} exists.", err=True)
+        sys.exit(EXIT_ERROR)
+    except (ModelGuardError, ValidationError) as exc:
+        click.echo(f"Error: {_render_error(exc)}", err=True)
+        sys.exit(EXIT_ERROR)
+    click.echo(f"Retired {updated_entry.key_id} in {trust_config_path}.")
+
+
+@trust.command("revoke-key")
+@click.argument("trust_config_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--key-id", required=True, help="SHA-256 fingerprint of the key to revoke.")
+def trust_revoke_key(trust_config_path: Path, key_id: str) -> None:
+    """Mark a key 'revoked', effective immediately for every future verification.
+
+    Unlike expiry, revocation is not something a key can be scheduled
+    to reach later -- this takes effect for any verification performed
+    from now on, regardless of what signing time a signature (forged or
+    genuine) claims. See docs/security/threat-model.md.
+    """
+    try:
+        config = load_trust_config_file(trust_config_path)
+        current = next(key for key in config.keys if key.key_id == _normalize(key_id))
+        updated_entry = _updated_entry(current, status="revoked")
+        updated = _replace_key(config, key_id, updated_entry)
+        save_trust_config_file(updated, trust_config_path)
+    except StopIteration:
+        click.echo(f"Error: No entry with fingerprint {_normalize(key_id)} exists.", err=True)
+        sys.exit(EXIT_ERROR)
+    except (ModelGuardError, ValidationError) as exc:
+        click.echo(f"Error: {_render_error(exc)}", err=True)
+        sys.exit(EXIT_ERROR)
+    click.echo(f"Revoked {updated_entry.key_id} in {trust_config_path}.")
+
+
+@trust.command("remove-key")
+@click.argument("trust_config_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--key-id", required=True, help="SHA-256 fingerprint of the key to remove.")
+def trust_remove_key(trust_config_path: Path, key_id: str) -> None:
+    """Delete a key's entry entirely, rather than marking it revoked.
+
+    Prefer `trust revoke-key` when there is any chance you want a
+    record that this key existed and was explicitly untrusted; use
+    this only to clean up an entry that should never have been added
+    (a typo, a test key) or once its revocation has been recorded
+    elsewhere (version control, an audit log) and the file itself
+    doesn't need to carry the history.
+    """
+    try:
+        config = load_trust_config_file(trust_config_path)
+        updated = _replace_key(config, key_id, None)
+        save_trust_config_file(updated, trust_config_path)
+    except (ModelGuardError, ValidationError) as exc:
+        click.echo(f"Error: {_render_error(exc)}", err=True)
+        sys.exit(EXIT_ERROR)
+    click.echo(f"Removed {_normalize(key_id)} from {trust_config_path}.")
 
 
 @policy.command("check")
