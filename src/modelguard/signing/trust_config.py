@@ -39,6 +39,7 @@ policy rule).
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -263,6 +264,26 @@ def load_trust_config_file(path: Path) -> TrustConfig:
         raise TrustConfigurationError(
             f"Trust configuration file {path} failed schema validation ({problems})."
         ) from exc
+
+
+def save_trust_config_file(config: TrustConfig, path: Path) -> None:
+    """Write ``config`` to ``path`` as YAML, atomically.
+
+    Writes to a temporary file in the same directory and renames it
+    into place, so a crash or concurrent read never observes a
+    partially-written file. Does not re-read or re-validate what it
+    wrote; callers that mutate a loaded config (add/retire/revoke a
+    key) should validate the *in-memory* ``TrustConfig`` -- which
+    already happened when it was constructed -- before calling this.
+    """
+    document = config.model_dump(mode="json", exclude_none=True)
+    text = yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    try:
+        tmp_path.write_text(text)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def build_minimal_trust_config(fingerprints: Iterable[str]) -> TrustConfig:
