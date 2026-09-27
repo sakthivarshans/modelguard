@@ -9,7 +9,7 @@ implemented.
 from modelguard.exceptions import ModelGuardError, VerificationDenied
 from modelguard.sdk import ModelGuard, VerificationResult
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "ModelGuard",
