@@ -57,8 +57,15 @@ never a signature's claimed signing time -- see
 `docs/security/threat-model.md` for why. `--trusted-fingerprint`
 remains fully supported and composes with `--trust-config`.
 
-Key rotation tooling, KMS, HSM, and Sigstore are not yet built (later
-Phase 7 slices) -- see `docs/limitations.md`.
+**Phase 7 slice 7c (key management):** `SignerProvider` adapters for
+AWS KMS (`modelguard.signing.kms`, extra `kms`) and PKCS#11/HSM
+(`modelguard.signing.hsm`, extra `hsm`) -- both SDK-level
+(`guard.sign_with_provider(...)`), tested against real moto KMS and
+real SoftHSM2 tokens respectively, not fakes. Trust-configuration
+rotation commands: `modelguard trust add-key|retire-key|revoke-key|
+remove-key`.
+
+Sigstore is not yet built -- see `docs/limitations.md`.
 
 See `docs/limitations.md` for what is explicitly out of scope so far.
 
