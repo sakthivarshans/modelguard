@@ -4,6 +4,77 @@ All notable changes to this project are documented here. This project
 follows semantic versioning once it reaches 1.0; pre-1.0 minor versions
 may include breaking changes, which will be called out explicitly.
 
+## [0.9.0] - Phase 7 slice 7c: key management (KMS, HSM, rotation CLI)
+
+### Added
+
+- **`modelguard.signing.kms.KmsSignerProvider`**: `SignerProvider`
+  backed by AWS KMS (`ECC_NIST_P256`, `ecdsa-p256-sha256`). Uses
+  `MessageType="RAW"` exclusively, after empirically confirming
+  `"DIGEST"` mode produces signatures that don't verify against
+  `cryptography` even when moto's own `Verify` reports them valid.
+  Requires the new `kms` extra.
+- **`modelguard.signing.hsm.Pkcs11SignerProvider`**: `SignerProvider`
+  backed by any PKCS#11 token (EC P-256). Hashes on the host before
+  calling the token's raw `ECDSA` mechanism (the only one most tokens,
+  SoftHSM2 included, actually expose) and converts between PKCS#11's
+  raw `r || s` signature / `CKA_EC_POINT` public key and the DER /
+  uncompressed-point wire format the `ecdsa-p256-sha256` scheme
+  expects. Requires the new `hsm` extra. Includes
+  `generate_ec_keypair()`, a provisioning helper for bootstrapping a
+  token (used by this project's own tests against a real SoftHSM2
+  token).
+- Trust configuration rotation CLI: `modelguard trust add-key`,
+  `retire-key`, `revoke-key`, `remove-key` -- mutate a trust config
+  file in place, atomically, with the same schema validation as
+  loading one.
+
+### Security
+
+- Both new providers fail closed on every failure mode (wrong key
+  type, missing key, wrong PIN/credentials, oversized message, network
+  error), converting to `SigningProviderError` with only the exception
+  type name -- whether called directly or through
+  `sign_with_provider`, which already re-verifies every signature
+  against the provider's own reported public key before returning an
+  envelope (unchanged from 7a, and still the backstop against a
+  provider whose `sign()` and `public_key()` disagree).
+- Two bugs found and fixed during manual end-to-end testing of the
+  rotation CLI, before any test was written for them (both now have
+  regression tests): `retire-key`/`revoke-key` used
+  `model_copy(update=...)`, which assigns directly into `__dict__` and
+  skips validation entirely, so a `--not-after` string was stored
+  un-parsed instead of becoming a real, checked `datetime` -- silently
+  defeating the naive-timestamp rejection; and every rotation command
+  let a raw `pydantic.ValidationError` escape as an unhandled
+  traceback instead of the same clean `Error: ...` message every other
+  malformed-input path in this project produces.
+
+### Testing
+
+- 43 new tests: 9 for the KMS provider against a real moto KMS
+  emulator (end-to-end sign+verify, key-spec rejection, wrong-usage-key
+  failure, nonexistent key, oversized-message pre-check, exception-text
+  leakage, public-key caching, missing-extra error), 11 for the HSM
+  provider against a real, freshly-provisioned SoftHSM2 token
+  (end-to-end sign+verify, point/signature shape checks, wrong PIN,
+  missing key/token, a synthetic wrong-length-signature test since
+  SoftHSM2 never produces one naturally, idempotent close, missing-extra
+  error), 14 for the trust rotation CLI (including the two regression
+  tests above and a full add/retire/remove rotation workflow), and 9
+  new mutation-checks across the KMS key-spec check, the HSM
+  signature-length check, and the CLI's not-found detection -- one of
+  which (the HSM length check) was initially **not** caught because no
+  existing test exercised that path; a targeted test was added and the
+  mutation re-run to confirm it now is, per the project's test-honesty
+  requirement to report and fix gaps rather than quietly move on.
+- Verified empirically, with no optional dependencies installed at
+  all (a bare venv, no boto3/psycopg/pkcs11/asn1crypto), that
+  `import modelguard` and `from modelguard.cli.main import cli` both
+  still succeed -- `kms.py` and `hsm.py` are excluded from
+  `modelguard.signing`'s package-level exports, imported only where
+  actually used, matching the existing `storage/s3.py` precedent.
+
 ## [0.8.0] - Phase 7 slice 7b: trust configuration
 
 ### Added
