@@ -216,3 +216,20 @@ revocation transparency log for the trust config itself, no wildcard
 or negative (deny-list) fingerprint rules, and no verification that a
 `signer_identity` binding corresponds to any real-world identity --
 see `docs/limitations.md`.
+
+## Addendum -- Phase 7 slice 7c (KMS, HSM, trust rotation)
+
+| Threat | Mitigation | Residual risk |
+| --- | --- | --- |
+| A KMS/HSM provider's error text (which can carry account IDs, key ARNs, key labels) leaks through a raised exception | Both `KmsSignerProvider` and `Pkcs11SignerProvider` catch every underlying exception in `public_key()`/`sign()` and re-raise `SigningProviderError` with only the exception type name, independent of and in addition to `sign_with_provider`'s own normalization. Tested for both providers with exceptions carrying a fake embedded secret/identifier. | An adapter author who raises a bare exception bypassing this wrapping (in a future third-party adapter) defeats it; enforced by tests on these two built-in adapters, not by the `SignerProvider` protocol itself. |
+| A KMS key of the wrong type (e.g. RSA, or a symmetric key) is used where a P-256 key is expected | `KmsSignerProvider.public_key()` checks `KeySpec` explicitly and refuses anything but `ECC_NIST_P256` before any signing is attempted. Tested against a real RSA_2048 KMS key. | None identified. |
+| An HSM/KMS provider returns a signature that does not match its own reported public key (e.g. a repointed key alias) | Already covered by the 7a mitigation in `sign_with_provider`: every signature is re-verified against the provider's own `public_key()` before an envelope is returned, regardless of which provider produced it. | Unchanged from 7a. |
+| A PKCS#11 token returns a malformed-length raw signature | `Pkcs11SignerProvider.sign()` checks the raw `r \|\| s` signature is exactly 64 bytes before DER-encoding it. SoftHSM2 never produces a malformed length naturally, so this was tested by substituting the private-key handle to force one -- and mutation-checked (removing the check made the guarding test fail, confirming it wasn't a checked-but-unreachable branch). | None identified for P-256; a future curve with a different fixed signature length would need its own constant, not a generalization of this one. |
+| The trust-configuration rotation CLI (`add-key`/`retire-key`/`revoke-key`/`remove-key`) corrupts the file on a partial write, or silently bypasses schema validation when mutating an existing entry | `save_trust_config_file` writes to a temp file and renames atomically. Entry mutation goes through full pydantic re-validation (`model_dump` + `model_validate`), not `model_copy(update=...)`, which was found during manual testing to silently skip validation and store an unvalidated raw string where a `datetime` was expected -- fixed and covered by two regression tests (`test_retire_key_with_not_after_produces_a_real_validated_datetime`, `test_retire_key_rejects_a_naive_not_after_cleanly`). Every mutation command also catches `pydantic.ValidationError` explicitly and renders it the same way `load_trust_config_file` does, rather than letting a raw traceback reach the user -- also found and fixed during manual testing, also covered by a regression test. | None identified for the write path itself; concurrent invocations against the same file remain a read-modify-write race (see `docs/limitations.md`). |
+
+## Explicit non-goals of Phase 7 slice 7c
+
+No CLI wiring for KMS/HSM-backed signing (SDK-only in this slice), no
+KMS key rotation tooling, no HSM key-generation CLI, no file locking
+on trust-config mutation, and no testing against a real hardware HSM
+(SoftHSM2 only) -- see `docs/limitations.md`.
